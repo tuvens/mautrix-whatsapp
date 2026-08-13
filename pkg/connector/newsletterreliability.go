@@ -109,12 +109,21 @@ func (wa *WhatsAppClient) newsletterBackfillLoop(ctx context.Context, api newsle
 		var next time.Duration
 		if err != nil {
 			rateLimitShaped := isRateLimitShaped(err)
+			if rateLimitShaped {
+				next = jitterNewsletterDelay(retryDelay)
+				retryDelay = min(retryDelay*2, newsletterMaxRetryDelay)
+			} else {
+				// A timeout or disconnect abandons this cycle and returns to
+				// the ordinary low-cadence tick. Only rate-limit-shaped
+				// responses increase request frequency through an explicit,
+				// bounded retry schedule.
+				next = jitterNewsletterDelay(wa.Main.Config.NewsletterReliability.PollInterval)
+				retryDelay = newsletterMinRetryDelay
+			}
 			wa.UserLogin.Log.Error().Err(err).
 				Bool("rate_limit_shaped", rateLimitShaped).
-				Dur("retry_in", retryDelay).
-				Msg("Failed to refresh subscribed newsletters; backing off without disturbing active channel pollers")
-			next = jitterNewsletterDelay(retryDelay)
-			retryDelay = min(retryDelay*2, newsletterMaxRetryDelay)
+				Dur("next_attempt_in", next).
+				Msg("Failed to refresh subscribed newsletters; active channel pollers are unchanged")
 		} else {
 			active := make(map[types.JID]struct{}, len(newsletters))
 			for _, newsletter := range newsletters {
@@ -155,12 +164,21 @@ func (wa *WhatsAppClient) newsletterChannelBackfillLoop(ctx context.Context, api
 		}
 		var next time.Duration
 		if err != nil {
+			rateLimitShaped := isRateLimitShaped(err)
+			if rateLimitShaped {
+				next = jitterNewsletterDelay(retryDelay)
+				retryDelay = min(retryDelay*2, newsletterMaxRetryDelay)
+			} else {
+				// Ordinary transport failures abandon this cycle. The next
+				// attempt is the next configured tick, rather than a burst of
+				// retries while the connection is unhealthy.
+				next = jitterNewsletterDelay(wa.Main.Config.NewsletterReliability.PollInterval)
+				retryDelay = newsletterMinRetryDelay
+			}
 			wa.UserLogin.Log.Error().Err(err).Stringer("newsletter_jid", jid).
-				Bool("rate_limit_shaped", isRateLimitShaped(err)).
-				Dur("retry_in", retryDelay).
-				Msg("Newsletter catch-up poll failed; backing off")
-			next = jitterNewsletterDelay(retryDelay)
-			retryDelay = min(retryDelay*2, newsletterMaxRetryDelay)
+				Bool("rate_limit_shaped", rateLimitShaped).
+				Dur("next_attempt_in", next).
+				Msg("Newsletter catch-up poll failed; cycle abandoned")
 		} else {
 			next = jitterNewsletterDelay(wa.Main.Config.NewsletterReliability.PollInterval)
 			retryDelay = newsletterMinRetryDelay
