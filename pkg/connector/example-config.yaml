@@ -70,6 +70,18 @@ initial_auto_reconnect: true
 # retry receipts if the bridge is restarted after the message is sent.
 use_whatsapp_retry_store: false
 
+# Reliability net for WhatsApp Channels (newsletters). Normal channel posts are
+# pushed without a live-updates subscription; the low-cadence poll fills any
+# gaps using the channel's monotonic server_id watermark.
+newsletter_reliability:
+    enable_backfill_poll: true
+    poll_interval: 6h
+    poll_count: 10
+    # This WhatsApp API only enables reaction/view-count metadata updates, not
+    # post delivery. Keep it off unless a measured A/B test shows value.
+    enable_live_updates: false
+    live_updates_channels: []
+
 # Settings for converting animated stickers.
 animated_sticker:
     # Format to which animated stickers should be converted.

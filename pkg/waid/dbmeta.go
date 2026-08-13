@@ -128,6 +128,7 @@ type PortalMetadata struct {
 	CommunityAnnouncementGroup bool                 `json:"is_cag,omitempty"`
 	AddressingMode             types.AddressingMode `json:"addressing_mode,omitempty"`
 	LIDMigrationAttempted      bool                 `json:"lid_migration_attempted,omitempty"`
+	LastNewsletterServerID     int64                `json:"last_newsletter_server_id,omitempty"`
 }
 
 type GhostMetadata struct {

@@ -22,6 +22,16 @@ const (
 	MediaRequestMethodLocalTime MediaRequestMethod = "local_time"
 )
 
+type NewsletterReliabilityConfig struct {
+	EnableBackfillPoll  bool          `yaml:"enable_backfill_poll"`
+	PollInterval        time.Duration `yaml:"poll_interval"`
+	PollCount           int           `yaml:"poll_count"`
+	EnableLiveUpdates   bool          `yaml:"enable_live_updates"`
+	LiveUpdatesChannels []string      `yaml:"live_updates_channels"`
+
+	liveUpdatesJIDs []types.JID `yaml:"-"`
+}
+
 //go:embed example-config.yaml
 var ExampleConfig string
 
@@ -52,6 +62,8 @@ type Config struct {
 	DirectMediaAutoRequest      bool          `yaml:"direct_media_auto_request"`
 	InitialAutoReconnect        bool          `yaml:"initial_auto_reconnect"`
 	UseWhatsAppRetryStore       bool          `yaml:"use_whatsapp_retry_store"`
+
+	NewsletterReliability NewsletterReliabilityConfig `yaml:"newsletter_reliability"`
 
 	AnimatedSticker msgconv.AnimatedStickerConfig `yaml:"animated_sticker"`
 
@@ -99,6 +111,22 @@ func (c *Config) PostProcess() error {
 	if err != nil {
 		return fmt.Errorf("failed to execute displayname template: %w", err)
 	}
+	if c.NewsletterReliability.EnableBackfillPoll {
+		if c.NewsletterReliability.PollInterval <= 0 {
+			return fmt.Errorf("newsletter_reliability.poll_interval must be positive when backfill polling is enabled")
+		}
+		if c.NewsletterReliability.PollCount <= 0 || c.NewsletterReliability.PollCount > 100 {
+			return fmt.Errorf("newsletter_reliability.poll_count must be between 1 and 100")
+		}
+	}
+	c.NewsletterReliability.liveUpdatesJIDs = nil
+	for _, rawJID := range c.NewsletterReliability.LiveUpdatesChannels {
+		jid, parseErr := types.ParseJID(rawJID)
+		if parseErr != nil || jid.Server != types.NewsletterServer {
+			return fmt.Errorf("newsletter_reliability.live_updates_channels contains invalid newsletter JID %q", rawJID)
+		}
+		c.NewsletterReliability.liveUpdatesJIDs = append(c.NewsletterReliability.liveUpdatesJIDs, jid)
+	}
 	return nil
 }
 
@@ -129,6 +157,12 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Bool, "direct_media_auto_request")
 	helper.Copy(up.Bool, "initial_auto_reconnect")
 	helper.Copy(up.Bool, "use_whatsapp_retry_store")
+
+	helper.Copy(up.Bool, "newsletter_reliability", "enable_backfill_poll")
+	helper.Copy(up.Str|up.Int, "newsletter_reliability", "poll_interval")
+	helper.Copy(up.Int, "newsletter_reliability", "poll_count")
+	helper.Copy(up.Bool, "newsletter_reliability", "enable_live_updates")
+	helper.Copy(up.List, "newsletter_reliability", "live_updates_channels")
 
 	helper.Copy(up.Str, "animated_sticker", "target")
 	helper.Copy(up.Int, "animated_sticker", "args", "width")
@@ -206,6 +240,7 @@ func (wa *WhatsAppConnector) GetConfig() (string, any, up.Upgrader) {
 			{"displayname_template"},
 			{"call_start_notices"},
 			{"history_sync"},
+			{"newsletter_reliability"},
 		},
 		Base: ExampleConfig,
 	}

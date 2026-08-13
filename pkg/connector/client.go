@@ -106,22 +106,24 @@ type WhatsAppClient struct {
 	JID       types.JID
 	MC        mClient
 
-	historySyncWakeup  chan struct{}
-	stopLoops          atomic.Pointer[context.CancelFunc]
-	resyncQueue        map[types.JID]resyncQueueItem
-	resyncQueueLock    sync.Mutex
-	nextResync         time.Time
-	directMediaRetries map[networkid.MessageID]*directMediaRetry
-	directMediaLock    sync.Mutex
-	mediaRetryLock     *semaphore.Weighted
-	offlineSyncWaiter  atomic.Pointer[chan error]
-	isNewLogin         bool
-	pushNamesSynced    *exsync.Event
-	lastPresence       types.Presence
-	createDedup        *exsync.Set[types.MessageID]
+	historySyncWakeup         chan struct{}
+	stopLoops                 atomic.Pointer[context.CancelFunc]
+	stopNewsletterReliability atomic.Pointer[context.CancelFunc]
+	resyncQueue               map[types.JID]resyncQueueItem
+	resyncQueueLock           sync.Mutex
+	nextResync                time.Time
+	directMediaRetries        map[networkid.MessageID]*directMediaRetry
+	directMediaLock           sync.Mutex
+	mediaRetryLock            *semaphore.Weighted
+	offlineSyncWaiter         atomic.Pointer[chan error]
+	isNewLogin                bool
+	pushNamesSynced           *exsync.Event
+	lastPresence              types.Presence
+	createDedup               *exsync.Set[types.MessageID]
 
 	appStateRecoveryLock      sync.Mutex
 	appStateFullSyncAttempted map[appstate.WAPatchName]time.Time
+	newsletterWatermarkLock   sync.Mutex
 }
 
 var (
@@ -359,6 +361,7 @@ func (wa *WhatsAppClient) callStopLoops() {
 	if stopHistorySyncLoop := wa.stopLoops.Swap(nil); stopHistorySyncLoop != nil {
 		(*stopHistorySyncLoop)()
 	}
+	wa.stopNewsletterReliabilityLoop()
 }
 
 func (wa *WhatsAppClient) Disconnect() {
