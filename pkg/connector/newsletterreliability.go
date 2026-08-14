@@ -269,7 +269,7 @@ func collectNewsletterCatchup(ctx context.Context, api newsletterAPI, jid types.
 			}
 			collected = append(collected, message)
 		}
-		if watermark == 0 || reachedWatermark || len(messages) < count {
+		if reachedWatermark || len(messages) < count {
 			break
 		}
 		if oldest == 0 || oldest == before {

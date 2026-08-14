@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,21 +100,44 @@ func TestCollectNewsletterCatchupPagesToWatermarkAndSortsOldestFirst(t *testing.
 	}
 }
 
-func TestCollectNewsletterCatchupBoundsFirstObservationToOnePage(t *testing.T) {
+func TestCollectNewsletterCatchupPagesInitialObservationToHistoryEnd(t *testing.T) {
 	api := &newsletterTestAPI{pages: map[types.MessageServerID][]*types.NewsletterMessage{
 		0:  {testNewsletterMessage(12), testNewsletterMessage(11)},
-		11: {testNewsletterMessage(10), testNewsletterMessage(9)},
+		11: {testNewsletterMessage(10)},
 	}}
 	jid := types.NewJID("12345", types.NewsletterServer)
 	messages, err := collectNewsletterCatchup(context.Background(), api, jid, 0, 2)
 	if err != nil {
 		t.Fatalf("collect failed: %v", err)
 	}
-	if len(api.requests) != 1 {
-		t.Fatalf("first observation made %d requests, want exactly one bounded page", len(api.requests))
+	if len(api.requests) != 2 || api.requests[1].Before != 11 {
+		t.Fatalf("first observation did not page to history end: %+v", api.requests)
 	}
-	if len(messages) != 2 || messages[0].MessageServerID != 11 || messages[1].MessageServerID != 12 {
+	if len(messages) != 3 || messages[0].MessageServerID != 10 || messages[1].MessageServerID != 11 || messages[2].MessageServerID != 12 {
 		t.Fatalf("unexpected initial catch-up messages: %+v", messages)
+	}
+}
+
+func TestCollectNewsletterCatchupRefusesGapBeyondPageCap(t *testing.T) {
+	pages := make(map[types.MessageServerID][]*types.NewsletterMessage)
+	var before types.MessageServerID
+	serverID := types.MessageServerID(1000)
+	for range newsletterMaxPollPages {
+		pages[before] = []*types.NewsletterMessage{
+			testNewsletterMessage(serverID),
+			testNewsletterMessage(serverID - 1),
+		}
+		before = serverID - 1
+		serverID -= 2
+	}
+	api := &newsletterTestAPI{pages: pages}
+	jid := types.NewJID("12345", types.NewsletterServer)
+	_, err := collectNewsletterCatchup(context.Background(), api, jid, 1, 2)
+	if err == nil || !strings.Contains(err.Error(), "exceeded bounded") {
+		t.Fatalf("expected bounded-gap refusal, got %v", err)
+	}
+	if len(api.requests) != newsletterMaxPollPages {
+		t.Fatalf("made %d requests, want cap %d", len(api.requests), newsletterMaxPollPages)
 	}
 }
 
