@@ -100,9 +100,6 @@ func jitterNewsletterDelay(base time.Duration) time.Duration {
 }
 
 func (wa *WhatsAppClient) newsletterBackfillLoop(ctx context.Context, api newsletterAPI) {
-	if !waitNewsletterDelay(ctx, jitterNewsletterDelay(newsletterInitialPollDelay)) {
-		return
-	}
 	workers := make(map[types.JID]context.CancelFunc)
 	defer func() {
 		for _, cancel := range workers {
@@ -165,6 +162,12 @@ func (wa *WhatsAppClient) newsletterBackfillLoop(ctx context.Context, api newsle
 }
 
 func (wa *WhatsAppClient) newsletterChannelBackfillLoop(ctx context.Context, api newsletterAPI, jid types.JID) {
+	// Discover subscriptions immediately after connect, but spread each
+	// channel's first fetch independently around the two-minute mark. A single
+	// global delay followed by 51 simultaneous iqs is not per-channel jitter.
+	if !waitNewsletterDelay(ctx, jitterNewsletterDelay(newsletterInitialPollDelay)) {
+		return
+	}
 	retryDelay := newsletterMinRetryDelay
 	for {
 		err := wa.pollNewsletterChannel(ctx, api, jid)
