@@ -429,12 +429,26 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 		dontRenderEdited:  dontRenderEdited,
 	})
 	if res.Success && evt.Info.Chat.Server == types.NewsletterServer && evt.Info.ServerID > 0 {
-		if err := wa.advanceNewsletterWatermark(ctx, evt.Info.Chat, evt.Info.ServerID); err != nil {
+		advanced, err := wa.advanceNewsletterWatermark(ctx, evt.Info.Chat, evt.Info.ServerID)
+		if err != nil {
 			wa.UserLogin.Log.Error().Err(err).
 				Stringer("newsletter_jid", evt.Info.Chat).
 				Int("server_id", evt.Info.ServerID).
 				Msg("Failed to persist newsletter watermark; leaving it unchanged so the poller retries")
 		}
+		// Safe soak instrumentation: no message payload, phone number or token.
+		// Warn is intentional because the paired harness forbids credential-
+		// capable info/debug logging. This record measures continuity, source
+		// (push vs poll) and latency without weakening that guard.
+		wa.UserLogin.Log.Warn().
+			Str("delivery_source", newsletterDeliverySource(ctx)).
+			Stringer("newsletter_jid", evt.Info.Chat).
+			Str("message_id", string(evt.Info.ID)).
+			Int("server_id", evt.Info.ServerID).
+			Time("message_timestamp", evt.Info.Timestamp).
+			Bool("watermark_advanced", advanced).
+			Bool("watermark_persisted", err == nil).
+			Msg("Newsletter reliability delivery audit")
 	}
 	return res.Success
 }

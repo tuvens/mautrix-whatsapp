@@ -65,6 +65,16 @@ func TestNewsletterReliabilityExampleConfigDefaults(t *testing.T) {
 	}
 }
 
+func TestNewsletterDeliverySourceMarksOnlySyntheticPollContext(t *testing.T) {
+	if got := newsletterDeliverySource(context.Background()); got != "push" {
+		t.Fatalf("plain live context source = %q, want push", got)
+	}
+	pollCtx := context.WithValue(context.Background(), newsletterPollDeliveryContextKey{}, true)
+	if got := newsletterDeliverySource(pollCtx); got != "poll" {
+		t.Fatalf("synthetic catch-up context source = %q, want poll", got)
+	}
+}
+
 func TestCollectNewsletterCatchupPagesToWatermarkAndSortsOldestFirst(t *testing.T) {
 	api := &newsletterTestAPI{pages: map[types.MessageServerID][]*types.NewsletterMessage{
 		0:   {testNewsletterMessage(105), testNewsletterMessage(104)},

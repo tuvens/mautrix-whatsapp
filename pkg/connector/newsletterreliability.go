@@ -37,6 +37,15 @@ type newsletterAPI interface {
 	NewsletterSubscribeLiveUpdates(context.Context, types.JID) (time.Duration, error)
 }
 
+type newsletterPollDeliveryContextKey struct{}
+
+func newsletterDeliverySource(ctx context.Context) string {
+	if fromPoll, _ := ctx.Value(newsletterPollDeliveryContextKey{}).(bool); fromPoll {
+		return "poll"
+	}
+	return "push"
+}
+
 func (wa *WhatsAppClient) startNewsletterReliabilityLoop() {
 	wa.stopNewsletterReliabilityLoop()
 	cfg := &wa.Main.Config.NewsletterReliability
@@ -218,10 +227,19 @@ func (wa *WhatsAppClient) pollNewsletterChannel(ctx context.Context, api newslet
 			return fmt.Errorf("server_id %d had no message body", message.MessageServerID)
 		}
 		evt := newsletterMessageEvent(jid, message)
-		if !wa.handleWAMessage(ctx, evt) {
+		pollCtx := context.WithValue(ctx, newsletterPollDeliveryContextKey{}, true)
+		if !wa.handleWAMessage(pollCtx, evt) {
 			return fmt.Errorf("bridge rejected server_id %d", message.MessageServerID)
 		}
 	}
+	// This deliberately uses warn: the paired bridge's logger must remain at
+	// warn or stricter because info/debug can carry pairing credentials. The
+	// record contains identifiers and counters only, never message payloads,
+	// and is the evidence that a 72-hour soak actually ran its poll cycles.
+	wa.UserLogin.Log.Warn().Stringer("newsletter_jid", jid).
+		Int64("starting_watermark", watermark).
+		Int("candidate_count", len(messages)).
+		Msg("Newsletter reliability poll audit")
 	return nil
 }
 
@@ -290,29 +308,29 @@ func (wa *WhatsAppClient) getNewsletterWatermark(ctx context.Context, jid types.
 	return portal.Metadata.(*waid.PortalMetadata).LastNewsletterServerID, nil
 }
 
-func (wa *WhatsAppClient) advanceNewsletterWatermark(ctx context.Context, jid types.JID, serverID types.MessageServerID) error {
+func (wa *WhatsAppClient) advanceNewsletterWatermark(ctx context.Context, jid types.JID, serverID types.MessageServerID) (bool, error) {
 	wa.newsletterWatermarkLock.Lock()
 	defer wa.newsletterWatermarkLock.Unlock()
 	portal, err := wa.Main.Bridge.GetPortalByKey(ctx, wa.makeWAPortalKey(jid))
 	if err != nil {
-		return err
+		return false, err
 	}
 	meta := portal.Metadata.(*waid.PortalMetadata)
 	next := int64(serverID)
 	if next <= meta.LastNewsletterServerID {
-		return nil
+		return false, nil
 	}
 	previous := meta.LastNewsletterServerID
 	meta.LastNewsletterServerID = next
 	if err = portal.Save(ctx); err != nil {
 		meta.LastNewsletterServerID = previous
-		return err
+		return false, err
 	}
 	wa.UserLogin.Log.Debug().Stringer("newsletter_jid", jid).
 		Int64("previous_server_id", previous).
 		Int64("server_id", next).
 		Msg("Advanced newsletter reliability watermark")
-	return nil
+	return true, nil
 }
 
 func (wa *WhatsAppClient) newsletterLiveUpdatesLoop(ctx context.Context, api newsletterAPI, jid types.JID) {
