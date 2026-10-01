@@ -11,6 +11,7 @@ package connector
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"slices"
@@ -20,6 +21,7 @@ import (
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"maunium.net/go/mautrix/bridgev2"
 
 	"go.mau.fi/mautrix-whatsapp/pkg/waid"
 )
@@ -27,8 +29,12 @@ import (
 const (
 	newsletterInitialPollDelay = 2 * time.Minute
 	newsletterMaxPollPages     = 100
+	newsletterMaxPollItems     = 1000
+	newsletterMaxPollDuration  = 30 * time.Second
+	newsletterMaxPending       = 1000
 	newsletterMinRetryDelay    = time.Minute
 	newsletterMaxRetryDelay    = time.Hour
+	newsletterWatermarkVersion = 1
 )
 
 type newsletterAPI interface {
@@ -211,11 +217,7 @@ func isRateLimitShaped(err error) bool {
 
 func (wa *WhatsAppClient) pollNewsletterChannel(ctx context.Context, api newsletterAPI, jid types.JID) error {
 	cfg := &wa.Main.Config.NewsletterReliability
-	watermark, err := wa.getNewsletterWatermark(ctx, jid)
-	if err != nil {
-		return fmt.Errorf("load watermark: %w", err)
-	}
-	messages, err := collectNewsletterCatchup(ctx, api, jid, watermark, cfg.PollCount)
+	state, messages, scan, err := wa.prepareNewsletterCatchup(ctx, api, jid, cfg.PollCount)
 	if err != nil {
 		return fmt.Errorf("fetch newsletter messages: %w", err)
 	}
@@ -240,53 +242,175 @@ func (wa *WhatsAppClient) pollNewsletterChannel(ctx context.Context, api newslet
 	// record contains identifiers and counters only, never message payloads,
 	// and is the evidence that a 72-hour soak actually ran its poll cycles.
 	wa.UserLogin.Log.Warn().Stringer("newsletter_jid", jid).
-		Int64("starting_watermark", watermark).
+		Int64("starting_watermark", state.watermark).
 		Int("candidate_count", len(messages)).
+		Int("history_pages", scan.pages).
+		Int("history_items", scan.items).
+		Bool("gap_pending", scan.pending).
+		Str("bounded_by", scan.boundedBy).
+		Int64("recovery_before", int64(scan.nextBefore)).
 		Msg("Newsletter reliability poll audit")
 	return nil
 }
 
+type newsletterCatchupState struct {
+	version        int
+	watermark      int64
+	recoveryBefore types.MessageServerID
+}
+
+type newsletterCatchupScan struct {
+	messages        []*types.NewsletterMessage
+	boundaryMessage *types.NewsletterMessage
+	boundaryIDs     []int64
+	oldest          types.MessageServerID
+	nextBefore      types.MessageServerID
+	pages           int
+	items           int
+	pending         bool
+	historyEnd      bool
+	boundedBy       string
+}
+
+type newsletterCatchupBoundary func(*types.NewsletterMessage) (bool, error)
+
 func collectNewsletterCatchup(ctx context.Context, api newsletterAPI, jid types.JID, watermark int64, count int) ([]*types.NewsletterMessage, error) {
-	var collected []*types.NewsletterMessage
-	var before types.MessageServerID
-	for page := 0; page < newsletterMaxPollPages; page++ {
-		messages, err := api.GetNewsletterMessages(ctx, jid, &whatsmeow.GetNewsletterMessagesParams{
-			Count:  count,
-			Before: before,
-		})
-		if err != nil {
-			return nil, err
-		}
-		if len(messages) == 0 {
+	scan, err := scanNewsletterCatchup(
+		ctx, api, jid, 0, count, newsletterMaxPollPages, newsletterMaxPollItems,
+		time.Now().Add(newsletterMaxPollDuration),
+		func(message *types.NewsletterMessage) (bool, error) {
+			return int64(message.MessageServerID) <= watermark, nil
+		},
+	)
+	if err != nil || scan.pending {
+		return nil, err
+	}
+	return scan.messages, nil
+}
+
+func scanNewsletterCatchup(
+	ctx context.Context,
+	api newsletterAPI,
+	jid types.JID,
+	before types.MessageServerID,
+	count int,
+	maxPages int,
+	maxItems int,
+	deadline time.Time,
+	boundary newsletterCatchupBoundary,
+) (newsletterCatchupScan, error) {
+	result := newsletterCatchupScan{nextBefore: before}
+	if count <= 0 {
+		return result, fmt.Errorf("newsletter history count must be positive")
+	}
+	seen := make(map[struct {
+		serverID  types.MessageServerID
+		messageID types.MessageID
+	}]struct{})
+	for {
+		if result.pages >= maxPages {
+			result.pending = true
+			result.boundedBy = "pages"
 			break
 		}
-		reachedWatermark := false
-		oldest := messages[0].MessageServerID
-		for _, message := range messages {
-			if message.MessageServerID < oldest {
-				oldest = message.MessageServerID
+		if result.items >= maxItems {
+			result.pending = true
+			result.boundedBy = "items"
+			break
+		}
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			result.pending = true
+			result.boundedBy = "time"
+			break
+		}
+		requestCount := min(count, maxItems-result.items)
+		if requestCount <= 0 {
+			result.pending = true
+			result.boundedBy = "items"
+			break
+		}
+		requestCtx := ctx
+		cancel := func() {}
+		if !deadline.IsZero() {
+			requestCtx, cancel = context.WithDeadline(ctx, deadline)
+		}
+		messages, err := api.GetNewsletterMessages(requestCtx, jid, &whatsmeow.GetNewsletterMessagesParams{
+			Count:  requestCount,
+			Before: before,
+		})
+		cancel()
+		if err != nil {
+			if !deadline.IsZero() && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+				result.pending = true
+				result.boundedBy = "time"
+				break
 			}
-			if int64(message.MessageServerID) <= watermark {
-				reachedWatermark = true
+			return result, err
+		}
+		if len(messages) > requestCount {
+			return result, fmt.Errorf("newsletter history returned %d items for bounded request of %d", len(messages), requestCount)
+		}
+		result.pages++
+		result.items += len(messages)
+		if len(messages) == 0 {
+			result.historyEnd = true
+			break
+		}
+		var oldest types.MessageServerID
+		reachedBoundary := false
+		for _, message := range messages {
+			if message == nil || message.MessageServerID <= 0 {
 				continue
 			}
-			collected = append(collected, message)
+			if oldest == 0 || message.MessageServerID < oldest {
+				oldest = message.MessageServerID
+			}
+			atBoundary, err := boundary(message)
+			if err != nil {
+				return result, err
+			}
+			if atBoundary {
+				if result.boundaryMessage == nil || message.MessageServerID < result.boundaryMessage.MessageServerID {
+					result.boundaryMessage = message
+				}
+				result.boundaryIDs = append(result.boundaryIDs, int64(message.MessageServerID))
+				reachedBoundary = true
+				continue
+			}
+			key := struct {
+				serverID  types.MessageServerID
+				messageID types.MessageID
+			}{message.MessageServerID, message.MessageID}
+			if _, exists := seen[key]; !exists {
+				seen[key] = struct{}{}
+				result.messages = append(result.messages, message)
+			}
 		}
-		if reachedWatermark || len(messages) < count {
+		if oldest == 0 {
+			return result, fmt.Errorf("newsletter history page contained no usable server IDs")
+		}
+		result.oldest = oldest
+		result.nextBefore = oldest
+		if reachedBoundary {
+			boundaryID := result.boundaryMessage.MessageServerID
+			result.messages = slices.DeleteFunc(result.messages, func(message *types.NewsletterMessage) bool {
+				return message.MessageServerID <= boundaryID
+			})
+			break
+		}
+		if len(messages) < requestCount {
+			result.historyEnd = true
 			break
 		}
 		if oldest == 0 || oldest == before {
-			return nil, fmt.Errorf("newsletter pagination did not advance before=%d", oldest)
+			return result, fmt.Errorf("newsletter pagination did not advance before=%d", oldest)
 		}
 		before = oldest
-		if page == newsletterMaxPollPages-1 {
-			return nil, fmt.Errorf("newsletter gap exceeded bounded %d-page catch-up", newsletterMaxPollPages)
-		}
 	}
-	slices.SortFunc(collected, func(a, b *types.NewsletterMessage) int {
+	slices.SortFunc(result.messages, func(a, b *types.NewsletterMessage) int {
 		return cmp.Compare(a.MessageServerID, b.MessageServerID)
 	})
-	return collected, nil
+	return result, nil
 }
 
 func newsletterMessageEvent(jid types.JID, message *types.NewsletterMessage) *events.Message {
@@ -311,29 +435,238 @@ func (wa *WhatsAppClient) getNewsletterWatermark(ctx context.Context, jid types.
 	return portal.Metadata.(*waid.PortalMetadata).LastNewsletterServerID, nil
 }
 
-func (wa *WhatsAppClient) advanceNewsletterWatermark(ctx context.Context, jid types.JID, serverID types.MessageServerID) (bool, error) {
+func (wa *WhatsAppClient) getNewsletterCatchupState(ctx context.Context, jid types.JID) (newsletterCatchupState, error) {
 	wa.newsletterWatermarkLock.Lock()
 	defer wa.newsletterWatermarkLock.Unlock()
 	portal, err := wa.Main.Bridge.GetPortalByKey(ctx, wa.makeWAPortalKey(jid))
 	if err != nil {
-		return false, err
+		return newsletterCatchupState{}, err
 	}
 	meta := portal.Metadata.(*waid.PortalMetadata)
-	next := int64(serverID)
-	if next <= meta.LastNewsletterServerID {
-		return false, nil
+	recoveryBefore := types.MessageServerID(meta.NewsletterRecoveryBefore)
+	if meta.NewsletterRecoveryBefore < 0 {
+		recoveryBefore = 0
 	}
-	previous := meta.LastNewsletterServerID
-	meta.LastNewsletterServerID = next
+	return newsletterCatchupState{
+		version:        meta.NewsletterWatermarkVersion,
+		watermark:      meta.LastNewsletterServerID,
+		recoveryBefore: recoveryBefore,
+	}, nil
+}
+
+func (wa *WhatsAppClient) prepareNewsletterCatchup(
+	ctx context.Context,
+	api newsletterAPI,
+	jid types.JID,
+	count int,
+) (newsletterCatchupState, []*types.NewsletterMessage, newsletterCatchupScan, error) {
+	state, err := wa.getNewsletterCatchupState(ctx, jid)
+	if err != nil {
+		return state, nil, newsletterCatchupScan{}, fmt.Errorf("load watermark state: %w", err)
+	}
+	legacyRecovery := state.version < newsletterWatermarkVersion && state.watermark > 0
+	initialHistory := state.version < newsletterWatermarkVersion && state.watermark == 0
+	boundary := newsletterCatchupBoundary(func(message *types.NewsletterMessage) (bool, error) {
+		return int64(message.MessageServerID) <= state.watermark, nil
+	})
+	if legacyRecovery {
+		boundary = func(message *types.NewsletterMessage) (bool, error) {
+			return wa.isNewsletterMessageDurable(ctx, jid, message)
+		}
+	} else if initialHistory {
+		boundary = func(*types.NewsletterMessage) (bool, error) { return false, nil }
+	}
+	scan, err := scanNewsletterCatchup(
+		ctx, api, jid, state.recoveryBefore, count,
+		newsletterMaxPollPages, newsletterMaxPollItems,
+		time.Now().Add(newsletterMaxPollDuration), boundary,
+	)
+	if err != nil {
+		return state, nil, scan, err
+	}
+	if scan.pending {
+		if err = wa.commitNewsletterCatchupState(ctx, jid, state, state.version, state.watermark, scan.nextBefore, nil); err != nil {
+			return state, nil, scan, fmt.Errorf("persist bounded recovery cursor: %w", err)
+		}
+		return state, nil, scan, nil
+	}
+
+	newVersion := state.version
+	newWatermark := state.watermark
+	if legacyRecovery {
+		if scan.boundaryMessage == nil {
+			return state, nil, scan, fmt.Errorf("legacy newsletter watermark %d has no durable receipt in bounded history", state.watermark)
+		}
+		newVersion = newsletterWatermarkVersion
+		newWatermark = int64(scan.boundaryMessage.MessageServerID) - 1
+	} else if initialHistory {
+		if !scan.historyEnd {
+			return state, nil, scan, fmt.Errorf("initial newsletter history did not reach a durable boundary")
+		}
+		newVersion = newsletterWatermarkVersion
+		if scan.oldest > 0 {
+			newWatermark = int64(scan.oldest) - 1
+		}
+	}
+	var recoveredDurableIDs []int64
+	if legacyRecovery {
+		recoveredDurableIDs = scan.boundaryIDs
+	}
+	if err = wa.commitNewsletterCatchupState(ctx, jid, state, newVersion, newWatermark, 0, recoveredDurableIDs); err != nil {
+		return state, nil, scan, fmt.Errorf("persist newsletter catch-up state: %w", err)
+	}
+	return state, scan.messages, scan, nil
+}
+
+func (wa *WhatsAppClient) commitNewsletterCatchupState(
+	ctx context.Context,
+	jid types.JID,
+	expected newsletterCatchupState,
+	version int,
+	watermark int64,
+	recoveryBefore types.MessageServerID,
+	recoveredDurableIDs []int64,
+) error {
+	wa.newsletterWatermarkLock.Lock()
+	defer wa.newsletterWatermarkLock.Unlock()
+	portal, err := wa.Main.Bridge.GetPortalByKey(ctx, wa.makeWAPortalKey(jid))
+	if err != nil {
+		return err
+	}
+	meta := portal.Metadata.(*waid.PortalMetadata)
+	if meta.NewsletterWatermarkVersion != expected.version ||
+		meta.LastNewsletterServerID != expected.watermark ||
+		meta.NewsletterRecoveryBefore != int64(expected.recoveryBefore) {
+		return fmt.Errorf("newsletter catch-up state changed while history was being fetched")
+	}
+	previousVersion := meta.NewsletterWatermarkVersion
+	previousWatermark := meta.LastNewsletterServerID
+	previousBefore := meta.NewsletterRecoveryBefore
+	previousPending := slices.Clone(meta.NewsletterPendingServerIDs)
+	meta.NewsletterWatermarkVersion = version
+	meta.LastNewsletterServerID = watermark
+	meta.NewsletterRecoveryBefore = int64(recoveryBefore)
+	for _, serverID := range recoveredDurableIDs {
+		if !slices.Contains(meta.NewsletterPendingServerIDs, serverID) {
+			meta.NewsletterPendingServerIDs = append(meta.NewsletterPendingServerIDs, serverID)
+		}
+	}
+	if len(meta.NewsletterPendingServerIDs) > newsletterMaxPending {
+		meta.NewsletterWatermarkVersion = previousVersion
+		meta.LastNewsletterServerID = previousWatermark
+		meta.NewsletterRecoveryBefore = previousBefore
+		meta.NewsletterPendingServerIDs = previousPending
+		return fmt.Errorf("newsletter pending receipt ledger reached bounded %d-item cap", newsletterMaxPending)
+	}
+	if meta.NewsletterWatermarkVersion >= newsletterWatermarkVersion {
+		advanceNewsletterPendingReceipts(meta)
+	}
 	if err = portal.Save(ctx); err != nil {
-		meta.LastNewsletterServerID = previous
+		meta.NewsletterWatermarkVersion = previousVersion
+		meta.LastNewsletterServerID = previousWatermark
+		meta.NewsletterRecoveryBefore = previousBefore
+		meta.NewsletterPendingServerIDs = previousPending
+		return err
+	}
+	return nil
+}
+
+func (wa *WhatsAppClient) isNewsletterMessageDurable(ctx context.Context, jid types.JID, message *types.NewsletterMessage) (bool, error) {
+	messageID := waid.MakeMessageID(jid, jid, message.MessageID)
+	portal, err := wa.Main.Bridge.GetPortalByKey(ctx, wa.makeWAPortalKey(jid))
+	if err != nil {
 		return false, err
 	}
+	parts, err := wa.Main.Bridge.DB.Message.GetAllPartsByID(ctx, portal.Receiver, messageID)
+	if err != nil {
+		return false, err
+	}
+	for _, part := range parts {
+		if !part.HasFakeMXID() {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func advanceNewsletterPendingReceipts(meta *waid.PortalMetadata) {
+	slices.Sort(meta.NewsletterPendingServerIDs)
+	meta.NewsletterPendingServerIDs = slices.Compact(meta.NewsletterPendingServerIDs)
+	meta.NewsletterPendingServerIDs = slices.DeleteFunc(meta.NewsletterPendingServerIDs, func(serverID int64) bool {
+		return serverID <= meta.LastNewsletterServerID
+	})
+	for len(meta.NewsletterPendingServerIDs) > 0 && meta.NewsletterPendingServerIDs[0] == meta.LastNewsletterServerID+1 {
+		meta.LastNewsletterServerID++
+		meta.NewsletterPendingServerIDs = meta.NewsletterPendingServerIDs[1:]
+	}
+}
+
+func (wa *WhatsAppClient) recordNewsletterDurableReceipt(
+	ctx context.Context,
+	portal *bridgev2.Portal,
+	jid types.JID,
+	serverID types.MessageServerID,
+) (advanced bool, pending int, err error) {
+	wa.newsletterWatermarkLock.Lock()
+	defer wa.newsletterWatermarkLock.Unlock()
+	meta := portal.Metadata.(*waid.PortalMetadata)
+	previousWatermark := meta.LastNewsletterServerID
+	previousPending := slices.Clone(meta.NewsletterPendingServerIDs)
+	next := int64(serverID)
+	if (meta.NewsletterWatermarkVersion >= newsletterWatermarkVersion && next <= meta.LastNewsletterServerID) ||
+		slices.Contains(meta.NewsletterPendingServerIDs, next) {
+		return false, len(meta.NewsletterPendingServerIDs), nil
+	}
+	if len(meta.NewsletterPendingServerIDs) >= newsletterMaxPending {
+		return false, len(meta.NewsletterPendingServerIDs), fmt.Errorf("newsletter pending receipt ledger reached bounded %d-item cap", newsletterMaxPending)
+	}
+	meta.NewsletterPendingServerIDs = append(meta.NewsletterPendingServerIDs, next)
+	if meta.NewsletterWatermarkVersion >= newsletterWatermarkVersion {
+		advanceNewsletterPendingReceipts(meta)
+	}
+	if err = portal.Save(ctx); err != nil {
+		meta.LastNewsletterServerID = previousWatermark
+		meta.NewsletterPendingServerIDs = previousPending
+		return false, len(previousPending), err
+	}
 	wa.UserLogin.Log.Debug().Stringer("newsletter_jid", jid).
-		Int64("previous_server_id", previous).
-		Int64("server_id", next).
-		Msg("Advanced newsletter reliability watermark")
-	return true, nil
+		Int64("previous_server_id", previousWatermark).
+		Int64("server_id", meta.LastNewsletterServerID).
+		Int("pending_receipts", len(meta.NewsletterPendingServerIDs)).
+		Msg("Recorded durable newsletter receipt")
+	return meta.LastNewsletterServerID > previousWatermark, len(meta.NewsletterPendingServerIDs), nil
+}
+
+func (evt *WAMessageEvent) recordNewsletterDurableReceipt(ctx context.Context, portal *bridgev2.Portal) {
+	parts, err := evt.wa.Main.Bridge.DB.Message.GetAllPartsByID(ctx, portal.Receiver, evt.GetID())
+	durableParts := 0
+	if err == nil {
+		for _, part := range parts {
+			if !part.HasFakeMXID() {
+				durableParts++
+			}
+		}
+	}
+	durable := err == nil && durableParts > 0 && (evt.newsletterExpectedParts == 0 || durableParts >= evt.newsletterExpectedParts)
+	advanced := false
+	pending := 0
+	if durable {
+		advanced, pending, err = evt.wa.recordNewsletterDurableReceipt(ctx, portal, evt.Info.Chat, evt.newsletterServerID)
+	}
+	log := evt.wa.UserLogin.Log.Warn().
+		Str("delivery_source", evt.newsletterDeliverySource).
+		Stringer("newsletter_jid", evt.Info.Chat).
+		Str("message_id", string(evt.Info.ID)).
+		Int("server_id", evt.Info.ServerID).
+		Int("durable_parts", durableParts).
+		Int("expected_parts", evt.newsletterExpectedParts).
+		Bool("durably_accepted", durable).
+		Bool("watermark_advanced", advanced).
+		Int("pending_receipts", pending)
+	if err != nil {
+		log = log.Err(err)
+	}
+	log.Msg("Newsletter reliability durable receipt audit")
 }
 
 func (wa *WhatsAppClient) newsletterLiveUpdatesLoop(ctx context.Context, api newsletterAPI, jid types.JID) {

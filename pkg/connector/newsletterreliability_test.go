@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -28,6 +29,7 @@ import (
 type newsletterTestAPI struct {
 	requests []whatsmeow.GetNewsletterMessagesParams
 	pages    map[types.MessageServerID][]*types.NewsletterMessage
+	errors   map[types.MessageServerID]error
 }
 
 func (api *newsletterTestAPI) GetSubscribedNewsletters(context.Context) ([]*types.NewsletterMetadata, error) {
@@ -36,6 +38,9 @@ func (api *newsletterTestAPI) GetSubscribedNewsletters(context.Context) ([]*type
 
 func (api *newsletterTestAPI) GetNewsletterMessages(_ context.Context, _ types.JID, params *whatsmeow.GetNewsletterMessagesParams) ([]*types.NewsletterMessage, error) {
 	api.requests = append(api.requests, *params)
+	if err := api.errors[params.Before]; err != nil {
+		return nil, err
+	}
 	return api.pages[params.Before], nil
 }
 
@@ -118,7 +123,7 @@ func TestCollectNewsletterCatchupPagesInitialObservationToHistoryEnd(t *testing.
 	}
 }
 
-func TestCollectNewsletterCatchupRefusesGapBeyondPageCap(t *testing.T) {
+func TestCollectNewsletterCatchupRetainsGapAtPageCap(t *testing.T) {
 	pages := make(map[types.MessageServerID][]*types.NewsletterMessage)
 	var before types.MessageServerID
 	serverID := types.MessageServerID(1000)
@@ -132,9 +137,17 @@ func TestCollectNewsletterCatchupRefusesGapBeyondPageCap(t *testing.T) {
 	}
 	api := &newsletterTestAPI{pages: pages}
 	jid := types.NewJID("12345", types.NewsletterServer)
-	_, err := collectNewsletterCatchup(context.Background(), api, jid, 1, 2)
-	if err == nil || !strings.Contains(err.Error(), "exceeded bounded") {
-		t.Fatalf("expected bounded-gap refusal, got %v", err)
+	scan, err := scanNewsletterCatchup(
+		context.Background(), api, jid, 0, 2, newsletterMaxPollPages, newsletterMaxPollItems,
+		time.Now().Add(time.Minute), func(message *types.NewsletterMessage) (bool, error) {
+			return int64(message.MessageServerID) <= 1, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("bounded scan failed: %v", err)
+	}
+	if !scan.pending || scan.boundedBy != "pages" || scan.nextBefore == 0 {
+		t.Fatalf("bounded scan did not retain page cursor: %+v", scan)
 	}
 	if len(api.requests) != newsletterMaxPollPages {
 		t.Fatalf("made %d requests, want cap %d", len(api.requests), newsletterMaxPollPages)
@@ -171,6 +184,249 @@ func (i *duplicateTestIntent) EnsureInvited(context.Context, id.RoomID, id.UserI
 
 type duplicateTestNetworkAPI struct {
 	bridgev2.NetworkAPI
+}
+
+func newNewsletterReliabilityTestClient(t *testing.T) (*WhatsAppClient, *bridgev2.Portal) {
+	t.Helper()
+	dbName := regexp.MustCompile(`[^a-zA-Z0-9]+`).ReplaceAllString(t.Name(), "-")
+	db, err := dbutil.NewWithDialect("file:"+dbName+"?mode=memory&cache=shared", "sqlite3")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	ctx := context.Background()
+	connector := &WhatsAppConnector{}
+	matrix := &duplicateTestMatrix{intent: &duplicateTestIntent{}}
+	bridge := bridgev2.NewBridge(networkid.BridgeID(dbName), db, zerolog.Nop(), &bridgeconfig.BridgeConfig{}, matrix, connector, commands.NewProcessor)
+	bridge.BackgroundCtx = ctx
+	if err = bridge.DB.Upgrade(ctx); err != nil {
+		t.Fatalf("upgrade bridge database: %v", err)
+	}
+	user, err := bridge.GetUserByMXID(ctx, "@newsletter-test:example.com")
+	if err != nil {
+		t.Fatalf("create test user: %v", err)
+	}
+	login, err := user.NewLogin(ctx, &database.UserLogin{ID: networkid.UserLoginID(dbName)}, &bridgev2.NewLoginParams{
+		LoadUserLogin: func(_ context.Context, login *bridgev2.UserLogin) error {
+			login.Client = &duplicateTestNetworkAPI{}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("create test login: %v", err)
+	}
+	wa := &WhatsAppClient{Main: connector, UserLogin: login}
+	jid := types.NewJID("12345", types.NewsletterServer)
+	portal, err := bridge.GetPortalByKey(ctx, wa.makeWAPortalKey(jid))
+	if err != nil {
+		t.Fatalf("create test portal: %v", err)
+	}
+	portal.MXID = "!newsletter:example.com"
+	if err = portal.Save(ctx); err != nil {
+		t.Fatalf("save test portal: %v", err)
+	}
+	return wa, portal
+}
+
+func setNewsletterTestState(t *testing.T, portal *bridgev2.Portal, watermark int64, version int) {
+	t.Helper()
+	meta := portal.Metadata.(*waid.PortalMetadata)
+	meta.LastNewsletterServerID = watermark
+	meta.NewsletterWatermarkVersion = version
+	meta.NewsletterPendingServerIDs = nil
+	meta.NewsletterRecoveryBefore = 0
+	if err := portal.Save(context.Background()); err != nil {
+		t.Fatalf("save test watermark: %v", err)
+	}
+}
+
+func TestNewsletterQueueAcceptanceDoesNotAdvanceWithoutDurableReceipt(t *testing.T) {
+	for _, matrixStatus := range []int{401, 403} {
+		t.Run(fmt.Sprintf("matrix_%d", matrixStatus), func(t *testing.T) {
+			wa, portal := newNewsletterReliabilityTestClient(t)
+			jid := types.NewJID("12345", types.NewsletterServer)
+			setNewsletterTestState(t, portal, 399, newsletterWatermarkVersion)
+			// A queued event whose Matrix send returned this status has no durable
+			// bridge message row when PostHandle runs.
+			evt := &WAMessageEvent{
+				MessageInfoWrapper: &MessageInfoWrapper{Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: jid, Sender: jid}, ID: types.MessageID(fmt.Sprintf("message-400-after-%d", matrixStatus)), ServerID: 400}, wa: wa},
+				newsletterServerID: 400,
+			}
+			evt.PostHandle(context.Background(), portal)
+			if got := portal.Metadata.(*waid.PortalMetadata).LastNewsletterServerID; got != 399 {
+				t.Fatalf("queue acceptance followed by Matrix %d advanced watermark to %d, want durable watermark 399", matrixStatus, got)
+			}
+		})
+	}
+}
+
+func TestNewsletterLaterHistoryRetriesFailedInterval(t *testing.T) {
+	wa, portal := newNewsletterReliabilityTestClient(t)
+	setNewsletterTestState(t, portal, 399, newsletterWatermarkVersion)
+	api := &newsletterTestAPI{pages: map[types.MessageServerID][]*types.NewsletterMessage{
+		0: {testNewsletterMessage(407), testNewsletterMessage(406), testNewsletterMessage(405), testNewsletterMessage(404), testNewsletterMessage(403), testNewsletterMessage(402), testNewsletterMessage(401), testNewsletterMessage(400), testNewsletterMessage(399)},
+	}}
+	_, messages, scan, err := wa.prepareNewsletterCatchup(context.Background(), api, types.NewJID("12345", types.NewsletterServer), 10)
+	if err != nil {
+		t.Fatalf("collect failed interval: %v", err)
+	}
+	if scan.pending || len(messages) != 8 {
+		t.Fatalf("recovered %d messages, want server IDs 400-407", len(messages))
+	}
+}
+
+func TestNewsletterDurableReceiptsAdvanceOnlyContiguously(t *testing.T) {
+	wa, portal := newNewsletterReliabilityTestClient(t)
+	jid := types.NewJID("12345", types.NewsletterServer)
+	setNewsletterTestState(t, portal, 399, newsletterWatermarkVersion)
+	advanced, pending, err := wa.recordNewsletterDurableReceipt(context.Background(), portal, jid, 401)
+	if err != nil {
+		t.Fatalf("record out-of-order durable receipt: %v", err)
+	}
+	if got := portal.Metadata.(*waid.PortalMetadata).LastNewsletterServerID; advanced || pending != 1 || got != 399 {
+		t.Fatalf("out-of-order receipt advanced watermark to %d, want 399 pending server ID 400", got)
+	}
+	advanced, pending, err = wa.recordNewsletterDurableReceipt(context.Background(), portal, jid, 400)
+	if err != nil {
+		t.Fatalf("record gap-closing durable receipt: %v", err)
+	}
+	if got := portal.Metadata.(*waid.PortalMetadata).LastNewsletterServerID; !advanced || pending != 0 || got != 401 {
+		t.Fatalf("gap-closing receipt produced watermark=%d advanced=%t pending=%d, want 401/true/0", got, advanced, pending)
+	}
+	advanced, pending, err = wa.recordNewsletterDurableReceipt(context.Background(), portal, jid, 400)
+	if err != nil || advanced || pending != 0 {
+		t.Fatalf("duplicate durable receipt was not idempotent: advanced=%t pending=%d err=%v", advanced, pending, err)
+	}
+}
+
+func TestNewsletterCrashReplayRecoversFromDurableBridgeMessage(t *testing.T) {
+	wa, portal := newNewsletterReliabilityTestClient(t)
+	jid := types.NewJID("12345", types.NewsletterServer)
+	setNewsletterTestState(t, portal, 399, newsletterWatermarkVersion)
+	message := testNewsletterMessage(400)
+	remoteID := waid.MakeMessageID(jid, jid, message.MessageID)
+	if err := wa.Main.Bridge.DB.Message.Insert(context.Background(), &database.Message{
+		ID: remoteID, MXID: "$durable-400", Room: portal.PortalKey, Timestamp: message.Timestamp, Metadata: &waid.MessageMetadata{},
+	}); err != nil {
+		t.Fatalf("insert durable bridge message: %v", err)
+	}
+	evt := &WAMessageEvent{
+		MessageInfoWrapper: &MessageInfoWrapper{Info: newsletterMessageEvent(jid, message).Info, wa: wa},
+		newsletterServerID: message.MessageServerID,
+	}
+	evt.PostHandle(context.Background(), portal)
+	watermark, err := wa.getNewsletterWatermark(context.Background(), jid)
+	if err != nil {
+		t.Fatalf("load watermark after crash replay: %v", err)
+	}
+	if watermark != 400 {
+		t.Fatalf("restart recovered watermark %d, want durable bridge receipt 400", watermark)
+	}
+	evt.PostHandle(context.Background(), portal)
+	if got := portal.Metadata.(*waid.PortalMetadata).LastNewsletterServerID; got != 400 {
+		t.Fatalf("replayed durable receipt advanced twice to %d", got)
+	}
+}
+
+func TestNewsletterBoundedGapRemainsPendingForNextPass(t *testing.T) {
+	jid := types.NewJID("12345", types.NewsletterServer)
+	boundary := func(message *types.NewsletterMessage) (bool, error) { return message.MessageServerID <= 1, nil }
+	api := &newsletterTestAPI{pages: map[types.MessageServerID][]*types.NewsletterMessage{
+		0:   {testNewsletterMessage(1000), testNewsletterMessage(999)},
+		999: {testNewsletterMessage(998), testNewsletterMessage(997)},
+		997: {testNewsletterMessage(996), testNewsletterMessage(1)},
+	}}
+	scan, err := scanNewsletterCatchup(context.Background(), api, jid, 0, 2, 2, 100, time.Now().Add(time.Minute), boundary)
+	if err != nil || !scan.pending || scan.boundedBy != "pages" || scan.nextBefore != 997 {
+		t.Fatalf("page-bounded scan did not retain pending cursor: scan=%+v err=%v", scan, err)
+	}
+	continued, err := scanNewsletterCatchup(context.Background(), api, jid, scan.nextBefore, 2, 2, 100, time.Now().Add(time.Minute), boundary)
+	if err != nil || continued.pending || continued.boundaryMessage == nil || continued.boundaryMessage.MessageServerID != 1 {
+		t.Fatalf("continued scan did not close pending gap: scan=%+v err=%v", continued, err)
+	}
+	itemBounded, err := scanNewsletterCatchup(context.Background(), api, jid, 0, 2, 100, 2, time.Now().Add(time.Minute), boundary)
+	if err != nil || !itemBounded.pending || itemBounded.boundedBy != "items" {
+		t.Fatalf("item-bounded scan result=%+v err=%v", itemBounded, err)
+	}
+	timeBounded, err := scanNewsletterCatchup(context.Background(), api, jid, 0, 2, 100, 100, time.Now().Add(-time.Second), boundary)
+	if err != nil || !timeBounded.pending || timeBounded.boundedBy != "time" {
+		t.Fatalf("time-bounded scan result=%+v err=%v", timeBounded, err)
+	}
+	for name, apiErr := range map[string]error{"rate_limit": fmt.Errorf("HTTP 429 rate limit"), "history_unavailable": fmt.Errorf("history unavailable")} {
+		t.Run(name, func(t *testing.T) {
+			failedAPI := &newsletterTestAPI{errors: map[types.MessageServerID]error{0: apiErr}}
+			_, gotErr := scanNewsletterCatchup(context.Background(), failedAPI, jid, 0, 2, 2, 100, time.Now().Add(time.Minute), boundary)
+			if gotErr == nil || !strings.Contains(gotErr.Error(), apiErr.Error()) {
+				t.Fatalf("scan error=%v, want %v", gotErr, apiErr)
+			}
+		})
+	}
+}
+
+func TestNewsletterBoundedRecoveryCursorPersistsAcrossPasses(t *testing.T) {
+	wa, portal := newNewsletterReliabilityTestClient(t)
+	jid := types.NewJID("12345", types.NewsletterServer)
+	setNewsletterTestState(t, portal, 1, newsletterWatermarkVersion)
+	pages := make(map[types.MessageServerID][]*types.NewsletterMessage)
+	var before types.MessageServerID
+	serverID := types.MessageServerID(2000)
+	for range newsletterMaxPollItems / 100 {
+		page := make([]*types.NewsletterMessage, 0, 100)
+		for range 100 {
+			page = append(page, testNewsletterMessage(serverID))
+			serverID--
+		}
+		pages[before] = page
+		before = page[len(page)-1].MessageServerID
+	}
+	pages[before] = []*types.NewsletterMessage{testNewsletterMessage(serverID), testNewsletterMessage(1)}
+	api := &newsletterTestAPI{pages: pages}
+	_, messages, scan, err := wa.prepareNewsletterCatchup(context.Background(), api, jid, 100)
+	if err != nil || len(messages) != 0 || !scan.pending || scan.boundedBy != "items" {
+		t.Fatalf("first bounded pass messages=%d scan=%+v err=%v", len(messages), scan, err)
+	}
+	meta := portal.Metadata.(*waid.PortalMetadata)
+	if meta.NewsletterRecoveryBefore != int64(before) {
+		t.Fatalf("persisted recovery cursor=%d, want %d", meta.NewsletterRecoveryBefore, before)
+	}
+	_, messages, scan, err = wa.prepareNewsletterCatchup(context.Background(), api, jid, 100)
+	if err != nil || scan.pending || len(messages) != 1 || messages[0].MessageServerID != serverID {
+		t.Fatalf("continued pass messages=%v scan=%+v err=%v", messages, scan, err)
+	}
+	if meta.NewsletterRecoveryBefore != 0 {
+		t.Fatalf("completed recovery left cursor %d, want 0", meta.NewsletterRecoveryBefore)
+	}
+}
+
+func TestNewsletterObservedStateRecovers400Through407WithoutDuplicating399(t *testing.T) {
+	wa, portal := newNewsletterReliabilityTestClient(t)
+	jid := types.NewJID("12345", types.NewsletterServer)
+	setNewsletterTestState(t, portal, 407, 0)
+	durable := testNewsletterMessage(399)
+	if err := wa.Main.Bridge.DB.Message.Insert(context.Background(), &database.Message{
+		ID: waid.MakeMessageID(jid, jid, durable.MessageID), MXID: "$durable-399", Room: portal.PortalKey, Timestamp: durable.Timestamp, Metadata: &waid.MessageMetadata{},
+	}); err != nil {
+		t.Fatalf("insert observed durable message: %v", err)
+	}
+	api := &newsletterTestAPI{pages: map[types.MessageServerID][]*types.NewsletterMessage{
+		0: {testNewsletterMessage(407), testNewsletterMessage(406), testNewsletterMessage(405), testNewsletterMessage(404), testNewsletterMessage(403), testNewsletterMessage(402), testNewsletterMessage(401), testNewsletterMessage(400), durable},
+	}}
+	_, messages, scan, err := wa.prepareNewsletterCatchup(context.Background(), api, jid, 10)
+	if err != nil {
+		t.Fatalf("recover observed state: %v", err)
+	}
+	if scan.pending || len(messages) != 8 {
+		t.Fatalf("observed-state recovery returned %d messages, want exactly 400-407 and no 399", len(messages))
+	}
+	for i, message := range messages {
+		if want := types.MessageServerID(400 + i); message.MessageServerID != want {
+			t.Fatalf("recovered message %d has server ID %d, want %d", i, message.MessageServerID, want)
+		}
+	}
+	meta := portal.Metadata.(*waid.PortalMetadata)
+	if meta.NewsletterWatermarkVersion != newsletterWatermarkVersion || meta.LastNewsletterServerID != 399 {
+		t.Fatalf("legacy recovery state version=%d watermark=%d, want %d/399", meta.NewsletterWatermarkVersion, meta.LastNewsletterServerID, newsletterWatermarkVersion)
+	}
 }
 
 func TestBridgeV2DropsFetchedCopyOfPushedNewsletterMessage(t *testing.T) {

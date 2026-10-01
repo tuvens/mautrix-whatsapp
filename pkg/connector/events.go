@@ -94,6 +94,9 @@ type WAMessageEvent struct {
 	isUndecryptableUpsertSubEvent bool
 	dontRenderEdited              bool
 	postHandle                    func()
+	newsletterServerID            types.MessageServerID
+	newsletterExpectedParts       int
+	newsletterDeliverySource      string
 }
 
 var (
@@ -174,6 +177,9 @@ func (evt *WAMessageEvent) PostHandle(ctx context.Context, portal *bridgev2.Port
 	if ph := evt.postHandle; ph != nil {
 		evt.postHandle = nil
 		ph()
+	}
+	if evt.newsletterServerID > 0 {
+		evt.recordNewsletterDurableReceipt(ctx, portal)
 	}
 }
 
@@ -288,6 +294,13 @@ func (evt *WAMessageEvent) ConvertMessage(ctx context.Context, portal *bridgev2.
 	converted := evt.wa.Main.MsgConv.ToMatrix(
 		ctx, portal, evt.wa.Client, intent, evt.Message, evt.MsgEvent.RawMessage, &evt.Info, &evt.OrigSource, evt.isViewOnce(), false, nil,
 	)
+	if evt.newsletterServerID > 0 {
+		for _, part := range converted.Parts {
+			if !part.DontBridge {
+				evt.newsletterExpectedParts++
+			}
+		}
+	}
 	if isFailedMedia(converted) {
 		evt.postHandle = func() {
 			evt.wa.processFailedMedia(ctx, portal.PortalKey, evt.GetID(), converted, false)

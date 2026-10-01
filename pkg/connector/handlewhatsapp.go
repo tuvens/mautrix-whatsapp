@@ -416,7 +416,7 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 		return
 	}
 
-	res := wa.UserLogin.QueueRemoteEvent(&WAMessageEvent{
+	remoteEvent := &WAMessageEvent{
 		MessageInfoWrapper: &MessageInfoWrapper{
 			OrigSource: origSource,
 			Info:       evt.Info,
@@ -427,28 +427,25 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 
 		parsedMessageType: parsedMessageType,
 		dontRenderEdited:  dontRenderEdited,
-	})
-	if res.Success && evt.Info.Chat.Server == types.NewsletterServer && evt.Info.ServerID > 0 {
-		advanced, err := wa.advanceNewsletterWatermark(ctx, evt.Info.Chat, evt.Info.ServerID)
-		if err != nil {
-			wa.UserLogin.Log.Error().Err(err).
-				Stringer("newsletter_jid", evt.Info.Chat).
-				Int("server_id", evt.Info.ServerID).
-				Msg("Failed to persist newsletter watermark; leaving it unchanged so the poller retries")
-		}
+	}
+	if evt.Info.Chat.Server == types.NewsletterServer && evt.Info.ServerID > 0 {
+		remoteEvent.newsletterServerID = evt.Info.ServerID
+		remoteEvent.newsletterDeliverySource = newsletterDeliverySource(ctx)
+	}
+	res := wa.UserLogin.QueueRemoteEvent(remoteEvent)
+	if evt.Info.Chat.Server == types.NewsletterServer && evt.Info.ServerID > 0 {
 		// Safe soak instrumentation: no message payload, phone number or token.
-		// Warn is intentional because the paired harness forbids credential-
-		// capable info/debug logging. This record measures continuity, source
-		// (push vs poll) and latency without weakening that guard.
+		// Queue acceptance is intentionally not a durable receipt: the Matrix
+		// send and bridge database write happen asynchronously after this call.
 		wa.UserLogin.Log.Warn().
-			Str("delivery_source", newsletterDeliverySource(ctx)).
+			Str("delivery_source", remoteEvent.newsletterDeliverySource).
 			Stringer("newsletter_jid", evt.Info.Chat).
 			Str("message_id", string(evt.Info.ID)).
 			Int("server_id", evt.Info.ServerID).
 			Time("message_timestamp", evt.Info.Timestamp).
-			Bool("watermark_advanced", advanced).
-			Bool("watermark_persisted", err == nil).
-			Msg("Newsletter reliability delivery audit")
+			Bool("queue_accepted", res.Success).
+			Bool("queue_async", res.Queued).
+			Msg("Newsletter reliability queue audit")
 	}
 	return res.Success
 }
