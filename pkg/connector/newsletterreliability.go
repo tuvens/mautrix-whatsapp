@@ -226,10 +226,10 @@ func (wa *WhatsAppClient) pollNewsletterChannel(ctx context.Context, api newslet
 			return ctx.Err()
 		}
 		if message.Message == nil {
-			wa.UserLogin.Log.Warn().Stringer("newsletter_jid", jid).
-				Int("server_id", message.MessageServerID).
-				Msg("Fetched newsletter message had no body; leaving watermark unchanged")
-			return fmt.Errorf("server_id %d had no message body", message.MessageServerID)
+			if err = wa.recordNewsletterNothingToBridgeReceipt(ctx, jid, message); err != nil {
+				return fmt.Errorf("record nothing-to-bridge receipt for server_id %d: %w", message.MessageServerID, err)
+			}
+			continue
 		}
 		evt := newsletterMessageEvent(jid, message)
 		pollCtx := context.WithValue(ctx, newsletterPollDeliveryContextKey{}, true)
@@ -658,6 +658,42 @@ func (wa *WhatsAppClient) recordNewsletterDurableReceipt(
 	jid types.JID,
 	serverID types.MessageServerID,
 ) (advanced bool, pending int, err error) {
+	return wa.recordNewsletterTerminalReceipt(ctx, portal, jid, serverID, "durable_delivery")
+}
+
+func (wa *WhatsAppClient) recordNewsletterNothingToBridgeReceipt(
+	ctx context.Context,
+	jid types.JID,
+	message *types.NewsletterMessage,
+) error {
+	portal, err := wa.Main.Bridge.GetPortalByKey(ctx, wa.makeWAPortalKey(jid))
+	if err != nil {
+		return err
+	}
+	advanced, pending, err := wa.recordNewsletterTerminalReceipt(ctx, portal, jid, message.MessageServerID, "nothing_to_bridge")
+	log := wa.UserLogin.Log.Warn().
+		Stringer("newsletter_jid", jid).
+		Str("message_id", string(message.MessageID)).
+		Int("server_id", message.MessageServerID).
+		Bool("terminal_receipt", err == nil).
+		Bool("durably_delivered", false).
+		Bool("watermark_advanced", advanced).
+		Int("pending_receipts", pending).
+		Str("reason", "no_message_body")
+	if err != nil {
+		log = log.Err(err)
+	}
+	log.Msg("Newsletter reliability nothing-to-bridge receipt audit")
+	return err
+}
+
+func (wa *WhatsAppClient) recordNewsletterTerminalReceipt(
+	ctx context.Context,
+	portal *bridgev2.Portal,
+	jid types.JID,
+	serverID types.MessageServerID,
+	receiptType string,
+) (advanced bool, pending int, err error) {
 	wa.newsletterWatermarkLock.Lock()
 	defer wa.newsletterWatermarkLock.Unlock()
 	meta := portal.Metadata.(*waid.PortalMetadata)
@@ -682,10 +718,11 @@ func (wa *WhatsAppClient) recordNewsletterDurableReceipt(
 		return false, len(previousPending), err
 	}
 	wa.UserLogin.Log.Debug().Stringer("newsletter_jid", jid).
+		Str("receipt_type", receiptType).
 		Int64("previous_server_id", previousWatermark).
 		Int64("server_id", meta.LastNewsletterServerID).
 		Int("pending_receipts", len(meta.NewsletterPendingServerIDs)).
-		Msg("Recorded durable newsletter receipt")
+		Msg("Recorded terminal newsletter receipt")
 	return meta.LastNewsletterServerID > previousWatermark, len(meta.NewsletterPendingServerIDs), nil
 }
 

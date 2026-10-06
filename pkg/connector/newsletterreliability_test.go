@@ -16,11 +16,13 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"gopkg.in/yaml.v3"
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/bridgeconfig"
 	"maunium.net/go/mautrix/bridgev2/commands"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
 	"go.mau.fi/mautrix-whatsapp/pkg/waid"
@@ -172,9 +174,15 @@ func (m *duplicateTestMatrix) NewUserIntent(context.Context, id.UserID, string) 
 
 type duplicateTestIntent struct {
 	bridgev2.MatrixAPI
+	sent int
 }
 
-func (i *duplicateTestIntent) GetMXID() id.UserID { return "@bot:example.com" }
+func (i *duplicateTestIntent) GetMXID() id.UserID   { return "@bot:example.com" }
+func (i *duplicateTestIntent) IsDoublePuppet() bool { return false }
+func (i *duplicateTestIntent) SendMessage(context.Context, id.RoomID, event.Type, *event.Content, *bridgev2.MatrixSendExtra) (*mautrix.RespSendEvent, error) {
+	i.sent++
+	return &mautrix.RespSendEvent{EventID: id.EventID(fmt.Sprintf("$sent-%d", i.sent))}, nil
+}
 func (i *duplicateTestIntent) EnsureJoined(context.Context, id.RoomID, ...bridgev2.EnsureJoinedParams) error {
 	return nil
 }
@@ -257,6 +265,52 @@ func TestNewsletterQueueAcceptanceDoesNotAdvanceWithoutDurableReceipt(t *testing
 				t.Fatalf("queue acceptance followed by Matrix %d advanced watermark to %d, want durable watermark 399", matrixStatus, got)
 			}
 		})
+	}
+}
+
+func TestNewsletterPollTreatsBodylessMessageAsTerminalReceiptAndContinues(t *testing.T) {
+	wa, portal := newNewsletterReliabilityTestClient(t)
+	jid := types.NewJID("12345", types.NewsletterServer)
+	setNewsletterTestState(t, portal, 405, newsletterWatermarkVersion)
+	wa.Main.Config.NewsletterReliability.PollCount = 10
+
+	durable := testNewsletterMessage(405)
+	if err := wa.Main.Bridge.DB.Message.Insert(context.Background(), &database.Message{
+		ID: waid.MakeMessageID(jid, jid, durable.MessageID), MXID: "$durable-405", Room: portal.PortalKey, Timestamp: durable.Timestamp, Metadata: &waid.MessageMetadata{},
+	}); err != nil {
+		t.Fatalf("insert durable 405 fixture: %v", err)
+	}
+	bodyless := testNewsletterMessage(406)
+	bodyless.Message = nil
+	bridgeable := testNewsletterMessage(407)
+	text := "recovered newsletter message 407"
+	bridgeable.Message = &waE2E.Message{Conversation: &text}
+	api := &newsletterTestAPI{pages: map[types.MessageServerID][]*types.NewsletterMessage{
+		0: {bridgeable, bodyless, durable},
+	}}
+
+	oldBuffer := bridgev2.PortalEventBuffer
+	bridgev2.PortalEventBuffer = 0
+	defer func() { bridgev2.PortalEventBuffer = oldBuffer }()
+	if err := wa.pollNewsletterChannel(context.Background(), api, jid); err != nil {
+		t.Fatalf("bodyless newsletter message abandoned catch-up cycle: %v", err)
+	}
+	if got := portal.Metadata.(*waid.PortalMetadata).LastNewsletterServerID; got != 407 {
+		t.Fatalf("watermark after 405 durable -> 406 bodyless -> 407 normal = %d, want 407", got)
+	}
+	if err := wa.pollNewsletterChannel(context.Background(), api, jid); err != nil {
+		t.Fatalf("repeat catch-up after terminal receipt failed: %v", err)
+	}
+	intent := wa.Main.Bridge.Matrix.(*duplicateTestMatrix).intent
+	if intent.sent != 1 {
+		t.Fatalf("normal server ID 407 delivered %d times across replay, want exactly once", intent.sent)
+	}
+	bodylessParts, err := wa.Main.Bridge.DB.Message.GetAllPartsByID(context.Background(), portal.Receiver, waid.MakeMessageID(jid, jid, bodyless.MessageID))
+	if err != nil {
+		t.Fatalf("query bodyless message parts: %v", err)
+	}
+	if len(bodylessParts) != 0 {
+		t.Fatalf("bodyless server ID 406 created %d durable message parts, want none", len(bodylessParts))
 	}
 }
 
