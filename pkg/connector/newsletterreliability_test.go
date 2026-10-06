@@ -29,21 +29,31 @@ import (
 )
 
 type newsletterTestAPI struct {
-	requests []whatsmeow.GetNewsletterMessagesParams
-	pages    map[types.MessageServerID][]*types.NewsletterMessage
-	errors   map[types.MessageServerID]error
+	requests       []whatsmeow.GetNewsletterMessagesParams
+	pages          map[types.MessageServerID][]*types.NewsletterMessage
+	errors         map[types.MessageServerID]error
+	decodeFailures map[types.MessageServerID]bool
 }
 
 func (api *newsletterTestAPI) GetSubscribedNewsletters(context.Context) ([]*types.NewsletterMetadata, error) {
 	return nil, nil
 }
 
-func (api *newsletterTestAPI) GetNewsletterMessages(_ context.Context, _ types.JID, params *whatsmeow.GetNewsletterMessagesParams) ([]*types.NewsletterMessage, error) {
+func (api *newsletterTestAPI) GetNewsletterMessages(_ context.Context, _ types.JID, params *whatsmeow.GetNewsletterMessagesParams) ([]*newsletterFetchedMessage, error) {
 	api.requests = append(api.requests, *params)
 	if err := api.errors[params.Before]; err != nil {
 		return nil, err
 	}
-	return api.pages[params.Before], nil
+	rawMessages := api.pages[params.Before]
+	messages := make([]*newsletterFetchedMessage, len(rawMessages))
+	for i, message := range rawMessages {
+		messages[i] = &newsletterFetchedMessage{
+			NewsletterMessage: message,
+			bodyAbsent: message != nil && message.Message == nil &&
+				!api.decodeFailures[message.MessageServerID],
+		}
+	}
+	return messages, nil
 }
 
 func (api *newsletterTestAPI) NewsletterSubscribeLiveUpdates(context.Context, types.JID) (time.Duration, error) {
@@ -311,6 +321,28 @@ func TestNewsletterPollTreatsBodylessMessageAsTerminalReceiptAndContinues(t *tes
 	}
 	if len(bodylessParts) != 0 {
 		t.Fatalf("bodyless server ID 406 created %d durable message parts, want none", len(bodylessParts))
+	}
+}
+
+func TestNewsletterPollDoesNotAcknowledgeDecodeFailure(t *testing.T) {
+	wa, portal := newNewsletterReliabilityTestClient(t)
+	jid := types.NewJID("12345", types.NewsletterServer)
+	setNewsletterTestState(t, portal, 405, newsletterWatermarkVersion)
+	wa.Main.Config.NewsletterReliability.PollCount = 10
+	undecodable := testNewsletterMessage(406)
+	undecodable.Message = nil
+	api := &newsletterTestAPI{
+		pages: map[types.MessageServerID][]*types.NewsletterMessage{
+			0: {undecodable, testNewsletterMessage(405)},
+		},
+		decodeFailures: map[types.MessageServerID]bool{406: true},
+	}
+
+	if err := wa.pollNewsletterChannel(context.Background(), api, jid); err == nil {
+		t.Fatal("protobuf decode failure was acknowledged as a terminal bodyless receipt")
+	}
+	if got := portal.Metadata.(*waid.PortalMetadata).LastNewsletterServerID; got != 405 {
+		t.Fatalf("protobuf decode failure advanced watermark to %d, want 405", got)
 	}
 }
 
