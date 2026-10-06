@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"maunium.net/go/mautrix/bridgev2"
@@ -39,8 +40,69 @@ const (
 
 type newsletterAPI interface {
 	GetSubscribedNewsletters(context.Context) ([]*types.NewsletterMetadata, error)
-	GetNewsletterMessages(context.Context, types.JID, *whatsmeow.GetNewsletterMessagesParams) ([]*types.NewsletterMessage, error)
+	GetNewsletterMessages(context.Context, types.JID, *whatsmeow.GetNewsletterMessagesParams) ([]*newsletterFetchedMessage, error)
 	NewsletterSubscribeLiveUpdates(context.Context, types.JID) (time.Duration, error)
+}
+
+type newsletterFetchedMessage struct {
+	*types.NewsletterMessage
+	bodyAbsent bool
+}
+
+type whatsmeowNewsletterAPI struct {
+	*whatsmeow.Client
+}
+
+func (api *whatsmeowNewsletterAPI) GetNewsletterMessages(
+	ctx context.Context,
+	jid types.JID,
+	params *whatsmeow.GetNewsletterMessagesParams,
+) ([]*newsletterFetchedMessage, error) {
+	attrs := waBinary.Attrs{
+		"type": "jid",
+		"jid":  jid,
+	}
+	if params != nil {
+		if params.Count != 0 {
+			attrs["count"] = params.Count
+		}
+		if params.Before != 0 {
+			attrs["before"] = params.Before
+		}
+	}
+	resp, err := api.DangerousInternals().SendIQ(ctx, whatsmeow.DangerousInfoQuery{
+		Namespace: "newsletter",
+		Type:      whatsmeow.DangerousInfoQueryType("get"),
+		To:        types.ServerJID,
+		Content: []waBinary.Node{{
+			Tag:   "messages",
+			Attrs: attrs,
+		}},
+	})
+	if err != nil {
+		return nil, err
+	}
+	messagesNode, ok := resp.GetOptionalChildByTag("messages")
+	if !ok {
+		return nil, fmt.Errorf("newsletter messages response is missing messages element")
+	}
+	rawMessages := messagesNode.GetChildrenByTag("message")
+	parsedMessages := api.DangerousInternals().ParseNewsletterMessages(&messagesNode)
+	if len(rawMessages) != len(parsedMessages) {
+		return nil, fmt.Errorf("newsletter message parser returned %d messages for %d raw envelopes", len(parsedMessages), len(rawMessages))
+	}
+	messages := make([]*newsletterFetchedMessage, len(parsedMessages))
+	for i, message := range parsedMessages {
+		if message == nil {
+			return nil, fmt.Errorf("newsletter message parser returned a nil message at envelope %d", i)
+		}
+		_, hasPlaintext := rawMessages[i].GetOptionalChildByTag("plaintext")
+		messages[i] = &newsletterFetchedMessage{
+			NewsletterMessage: message,
+			bodyAbsent:        !hasPlaintext,
+		}
+	}
+	return messages, nil
 }
 
 type newsletterPollDeliveryContextKey struct{}
@@ -61,7 +123,7 @@ func (wa *WhatsAppClient) startNewsletterReliabilityLoop() {
 	ctx, cancel := context.WithCancel(wa.Main.Bridge.BackgroundCtx)
 	wa.stopNewsletterReliability.Store(&cancel)
 	ctx = wa.UserLogin.Log.WithContext(ctx)
-	go wa.newsletterReliabilityLoop(ctx, wa.Client)
+	go wa.newsletterReliabilityLoop(ctx, &whatsmeowNewsletterAPI{Client: wa.Client})
 }
 
 func (wa *WhatsAppClient) stopNewsletterReliabilityLoop() {
@@ -225,13 +287,16 @@ func (wa *WhatsAppClient) pollNewsletterChannel(ctx context.Context, api newslet
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if message.Message == nil {
-			wa.UserLogin.Log.Warn().Stringer("newsletter_jid", jid).
-				Int("server_id", message.MessageServerID).
-				Msg("Fetched newsletter message had no body; leaving watermark unchanged")
-			return fmt.Errorf("server_id %d had no message body", message.MessageServerID)
+		if message.bodyAbsent {
+			if err = wa.recordNewsletterNothingToBridgeReceipt(ctx, jid, message.NewsletterMessage); err != nil {
+				return fmt.Errorf("record nothing-to-bridge receipt for server_id %d: %w", message.MessageServerID, err)
+			}
+			continue
 		}
-		evt := newsletterMessageEvent(jid, message)
+		if message.Message == nil {
+			return fmt.Errorf("newsletter server_id %d contained plaintext that could not be decoded", message.MessageServerID)
+		}
+		evt := newsletterMessageEvent(jid, message.NewsletterMessage)
 		pollCtx := context.WithValue(ctx, newsletterPollDeliveryContextKey{}, true)
 		if !wa.handleWAMessage(pollCtx, evt) {
 			return fmt.Errorf("bridge rejected server_id %d", message.MessageServerID)
@@ -260,7 +325,7 @@ type newsletterCatchupState struct {
 }
 
 type newsletterCatchupScan struct {
-	messages        []*types.NewsletterMessage
+	messages        []*newsletterFetchedMessage
 	boundaryMessage *types.NewsletterMessage
 	boundaryIDs     []int64
 	oldest          types.MessageServerID
@@ -275,7 +340,7 @@ type newsletterCatchupScan struct {
 type newsletterCatchupBoundary func(*types.NewsletterMessage) (bool, error)
 type newsletterCatchupBoundaryStop func(*types.NewsletterMessage, bool) bool
 
-func collectNewsletterCatchup(ctx context.Context, api newsletterAPI, jid types.JID, watermark int64, count int) ([]*types.NewsletterMessage, error) {
+func collectNewsletterCatchup(ctx context.Context, api newsletterAPI, jid types.JID, watermark int64, count int) ([]*newsletterFetchedMessage, error) {
 	scan, err := scanNewsletterCatchup(
 		ctx, api, jid, 0, count, newsletterMaxPollPages, newsletterMaxPollItems,
 		time.Now().Add(newsletterMaxPollDuration),
@@ -378,21 +443,21 @@ func scanNewsletterCatchupWithStop(
 		var oldest types.MessageServerID
 		reachedBoundary := false
 		for _, message := range messages {
-			if message == nil || message.MessageServerID <= 0 {
+			if message == nil || message.NewsletterMessage == nil || message.MessageServerID <= 0 {
 				continue
 			}
 			if oldest == 0 || message.MessageServerID < oldest {
 				oldest = message.MessageServerID
 			}
-			atBoundary, err := boundary(message)
+			atBoundary, err := boundary(message.NewsletterMessage)
 			if err != nil {
 				return result, err
 			}
 			if atBoundary {
 				result.boundaryIDs = append(result.boundaryIDs, int64(message.MessageServerID))
-				if stopAtBoundary(message, true) {
+				if stopAtBoundary(message.NewsletterMessage, true) {
 					if result.boundaryMessage == nil || message.MessageServerID < result.boundaryMessage.MessageServerID {
-						result.boundaryMessage = message
+						result.boundaryMessage = message.NewsletterMessage
 					}
 					reachedBoundary = true
 				}
@@ -424,7 +489,7 @@ func scanNewsletterCatchupWithStop(
 		}
 		before = oldest
 	}
-	slices.SortFunc(result.messages, func(a, b *types.NewsletterMessage) int {
+	slices.SortFunc(result.messages, func(a, b *newsletterFetchedMessage) int {
 		return cmp.Compare(a.MessageServerID, b.MessageServerID)
 	})
 	return result, nil
@@ -476,7 +541,7 @@ func (wa *WhatsAppClient) prepareNewsletterCatchup(
 	api newsletterAPI,
 	jid types.JID,
 	count int,
-) (newsletterCatchupState, []*types.NewsletterMessage, newsletterCatchupScan, error) {
+) (newsletterCatchupState, []*newsletterFetchedMessage, newsletterCatchupScan, error) {
 	state, err := wa.getNewsletterCatchupState(ctx, jid)
 	if err != nil {
 		return state, nil, newsletterCatchupScan{}, fmt.Errorf("load watermark state: %w", err)
@@ -658,6 +723,42 @@ func (wa *WhatsAppClient) recordNewsletterDurableReceipt(
 	jid types.JID,
 	serverID types.MessageServerID,
 ) (advanced bool, pending int, err error) {
+	return wa.recordNewsletterTerminalReceipt(ctx, portal, jid, serverID, "durable_delivery")
+}
+
+func (wa *WhatsAppClient) recordNewsletterNothingToBridgeReceipt(
+	ctx context.Context,
+	jid types.JID,
+	message *types.NewsletterMessage,
+) error {
+	portal, err := wa.Main.Bridge.GetPortalByKey(ctx, wa.makeWAPortalKey(jid))
+	if err != nil {
+		return err
+	}
+	advanced, pending, err := wa.recordNewsletterTerminalReceipt(ctx, portal, jid, message.MessageServerID, "nothing_to_bridge")
+	log := wa.UserLogin.Log.Warn().
+		Stringer("newsletter_jid", jid).
+		Str("message_id", string(message.MessageID)).
+		Int("server_id", message.MessageServerID).
+		Bool("terminal_receipt", err == nil).
+		Bool("durably_delivered", false).
+		Bool("watermark_advanced", advanced).
+		Int("pending_receipts", pending).
+		Str("reason", "no_message_body")
+	if err != nil {
+		log = log.Err(err)
+	}
+	log.Msg("Newsletter reliability nothing-to-bridge receipt audit")
+	return err
+}
+
+func (wa *WhatsAppClient) recordNewsletterTerminalReceipt(
+	ctx context.Context,
+	portal *bridgev2.Portal,
+	jid types.JID,
+	serverID types.MessageServerID,
+	receiptType string,
+) (advanced bool, pending int, err error) {
 	wa.newsletterWatermarkLock.Lock()
 	defer wa.newsletterWatermarkLock.Unlock()
 	meta := portal.Metadata.(*waid.PortalMetadata)
@@ -682,10 +783,11 @@ func (wa *WhatsAppClient) recordNewsletterDurableReceipt(
 		return false, len(previousPending), err
 	}
 	wa.UserLogin.Log.Debug().Stringer("newsletter_jid", jid).
+		Str("receipt_type", receiptType).
 		Int64("previous_server_id", previousWatermark).
 		Int64("server_id", meta.LastNewsletterServerID).
 		Int("pending_receipts", len(meta.NewsletterPendingServerIDs)).
-		Msg("Recorded durable newsletter receipt")
+		Msg("Recorded terminal newsletter receipt")
 	return meta.LastNewsletterServerID > previousWatermark, len(meta.NewsletterPendingServerIDs), nil
 }
 
