@@ -20,6 +20,7 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/json"
+	"sync"
 	"time"
 
 	"go.mau.fi/util/exerrors"
@@ -133,6 +134,34 @@ type PortalMetadata struct {
 	NewsletterPendingServerIDs    []int64              `json:"newsletter_pending_server_ids,omitempty"`
 	NewsletterRecoveryBefore      int64                `json:"newsletter_recovery_before,omitempty"`
 	NewsletterUndecodableFailures map[int64]int        `json:"newsletter_undecodable_failures,omitempty"`
+
+	newsletterUndecodableFailuresLock sync.RWMutex
+}
+
+func (pm *PortalMetadata) GetNewsletterUndecodableFailures() map[int64]int {
+	pm.newsletterUndecodableFailuresLock.RLock()
+	defer pm.newsletterUndecodableFailuresLock.RUnlock()
+	return pm.NewsletterUndecodableFailures
+}
+
+func (pm *PortalMetadata) SetNewsletterUndecodableFailures(failures map[int64]int) {
+	pm.newsletterUndecodableFailuresLock.Lock()
+	defer pm.newsletterUndecodableFailuresLock.Unlock()
+	pm.NewsletterUndecodableFailures = failures
+}
+
+func (pm *PortalMetadata) MarshalJSON() ([]byte, error) {
+	pm.newsletterUndecodableFailuresLock.RLock()
+	defer pm.newsletterUndecodableFailuresLock.RUnlock()
+	type portalMetadataJSON PortalMetadata
+	return json.Marshal((*portalMetadataJSON)(pm))
+}
+
+func (pm *PortalMetadata) UnmarshalJSON(data []byte) error {
+	pm.newsletterUndecodableFailuresLock.Lock()
+	defer pm.newsletterUndecodableFailuresLock.Unlock()
+	type portalMetadataJSON PortalMetadata
+	return json.Unmarshal(data, (*portalMetadataJSON)(pm))
 }
 
 type GhostMetadata struct {

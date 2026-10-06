@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -464,6 +465,57 @@ func TestNewsletterPollDecodeSuccessAfterTwoFailuresClearsCountAndDelivers(t *te
 	}
 	if regexp.MustCompile(`newsletter_undecodable_failures[^}]*406`).Match(metadataJSON) {
 		t.Fatalf("later decode success retained failure count: %s", metadataJSON)
+	}
+}
+
+func TestNewsletterFailureCountUpdateDoesNotRaceConcurrentPortalSave(t *testing.T) {
+	wa, portal := newNewsletterReliabilityTestClient(t)
+	jid := types.NewJID("12345", types.NewsletterServer)
+	setNewsletterTestState(t, portal, 405, newsletterWatermarkVersion)
+
+	ctx := context.Background()
+	start := make(chan struct{})
+	stop := make(chan struct{})
+	saveErr := make(chan error, 1)
+	var ready sync.WaitGroup
+	ready.Add(1)
+	go func() {
+		ready.Done()
+		<-start
+		for {
+			select {
+			case <-stop:
+				saveErr <- nil
+				return
+			default:
+				if err := portal.Save(ctx); err != nil {
+					saveErr <- err
+					return
+				}
+			}
+		}
+	}()
+	ready.Wait()
+	close(start)
+
+	for serverID := types.MessageServerID(1000); serverID < 1064; serverID++ {
+		quarantined, err := wa.recordNewsletterUndecodableFailure(ctx, jid, &newsletterFetchedMessage{
+			NewsletterMessage: testNewsletterMessage(serverID),
+		})
+		if err != nil {
+			close(stop)
+			<-saveErr
+			t.Fatalf("record failure for server ID %d: %v", serverID, err)
+		}
+		if quarantined {
+			close(stop)
+			<-saveErr
+			t.Fatalf("first failure for server ID %d was quarantined", serverID)
+		}
+	}
+	close(stop)
+	if err := <-saveErr; err != nil {
+		t.Fatalf("concurrent portal save: %v", err)
 	}
 }
 

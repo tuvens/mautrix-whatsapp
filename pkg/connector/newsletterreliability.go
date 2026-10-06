@@ -871,16 +871,18 @@ func (wa *WhatsAppClient) recordNewsletterUndecodableFailure(
 	wa.Main.newsletterWatermarkLock.Lock()
 	defer wa.Main.newsletterWatermarkLock.Unlock()
 	meta := portal.Metadata.(*waid.PortalMetadata)
-	previousFailures := maps.Clone(meta.NewsletterUndecodableFailures)
-	if meta.NewsletterUndecodableFailures == nil {
-		meta.NewsletterUndecodableFailures = make(map[int64]int)
+	previousFailures := meta.GetNewsletterUndecodableFailures()
+	updatedFailures := maps.Clone(previousFailures)
+	if updatedFailures == nil {
+		updatedFailures = make(map[int64]int)
 	}
 	serverID := int64(message.MessageServerID)
-	failures := meta.NewsletterUndecodableFailures[serverID] + 1
-	meta.NewsletterUndecodableFailures[serverID] = failures
+	failures := updatedFailures[serverID] + 1
+	updatedFailures[serverID] = failures
+	meta.SetNewsletterUndecodableFailures(updatedFailures)
 	if failures < newsletterUndecodableLimit {
 		if err = portal.Save(ctx); err != nil {
-			meta.NewsletterUndecodableFailures = previousFailures
+			meta.SetNewsletterUndecodableFailures(previousFailures)
 			return false, err
 		}
 		wa.UserLogin.Log.Warn().Stringer("newsletter_jid", jid).
@@ -895,38 +897,42 @@ func (wa *WhatsAppClient) recordNewsletterUndecodableFailure(
 	previousPending := slices.Clone(meta.NewsletterPendingServerIDs)
 	if (meta.NewsletterWatermarkVersion >= newsletterWatermarkVersion && serverID <= meta.LastNewsletterServerID) ||
 		slices.Contains(meta.NewsletterPendingServerIDs, serverID) {
-		delete(meta.NewsletterUndecodableFailures, serverID)
-		if len(meta.NewsletterUndecodableFailures) == 0 {
-			meta.NewsletterUndecodableFailures = nil
+		remainingFailures := maps.Clone(updatedFailures)
+		delete(remainingFailures, serverID)
+		if len(remainingFailures) == 0 {
+			remainingFailures = nil
 		}
+		meta.SetNewsletterUndecodableFailures(remainingFailures)
 		if err = portal.Save(ctx); err != nil {
-			meta.NewsletterUndecodableFailures = previousFailures
+			meta.SetNewsletterUndecodableFailures(previousFailures)
 			return false, err
 		}
 		return true, nil
 	}
 	gapClosing := meta.NewsletterWatermarkVersion >= newsletterWatermarkVersion && serverID == meta.LastNewsletterServerID+1
 	if len(meta.NewsletterPendingServerIDs) >= newsletterMaxPending && !gapClosing {
-		meta.NewsletterUndecodableFailures = previousFailures
+		meta.SetNewsletterUndecodableFailures(previousFailures)
 		return false, fmt.Errorf("newsletter pending receipt ledger reached bounded %d-item cap", newsletterMaxPending)
 	}
 	quarantinePath, err := wa.writeNewsletterQuarantineEnvelope(jid, message)
 	if err != nil {
-		meta.NewsletterUndecodableFailures = previousFailures
+		meta.SetNewsletterUndecodableFailures(previousFailures)
 		return false, err
 	}
 	meta.NewsletterPendingServerIDs = append(meta.NewsletterPendingServerIDs, serverID)
 	if meta.NewsletterWatermarkVersion >= newsletterWatermarkVersion {
 		advanceNewsletterPendingReceipts(meta)
 	}
-	delete(meta.NewsletterUndecodableFailures, serverID)
-	if len(meta.NewsletterUndecodableFailures) == 0 {
-		meta.NewsletterUndecodableFailures = nil
+	remainingFailures := maps.Clone(updatedFailures)
+	delete(remainingFailures, serverID)
+	if len(remainingFailures) == 0 {
+		remainingFailures = nil
 	}
+	meta.SetNewsletterUndecodableFailures(remainingFailures)
 	if err = portal.Save(ctx); err != nil {
 		meta.LastNewsletterServerID = previousWatermark
 		meta.NewsletterPendingServerIDs = previousPending
-		meta.NewsletterUndecodableFailures = previousFailures
+		meta.SetNewsletterUndecodableFailures(previousFailures)
 		return false, err
 	}
 	wa.UserLogin.Log.Warn().Stringer("newsletter_jid", jid).
@@ -956,16 +962,18 @@ func (wa *WhatsAppClient) clearNewsletterUndecodableFailure(
 	defer wa.Main.newsletterWatermarkLock.Unlock()
 	meta := portal.Metadata.(*waid.PortalMetadata)
 	key := int64(serverID)
-	if _, exists := meta.NewsletterUndecodableFailures[key]; !exists {
+	previousFailures := meta.GetNewsletterUndecodableFailures()
+	if _, exists := previousFailures[key]; !exists {
 		return nil
 	}
-	previousFailures := maps.Clone(meta.NewsletterUndecodableFailures)
-	delete(meta.NewsletterUndecodableFailures, key)
-	if len(meta.NewsletterUndecodableFailures) == 0 {
-		meta.NewsletterUndecodableFailures = nil
+	updatedFailures := maps.Clone(previousFailures)
+	delete(updatedFailures, key)
+	if len(updatedFailures) == 0 {
+		updatedFailures = nil
 	}
+	meta.SetNewsletterUndecodableFailures(updatedFailures)
 	if err = portal.Save(ctx); err != nil {
-		meta.NewsletterUndecodableFailures = previousFailures
+		meta.SetNewsletterUndecodableFailures(previousFailures)
 		return err
 	}
 	wa.UserLogin.Log.Debug().Stringer("newsletter_jid", jid).
@@ -986,7 +994,7 @@ func (wa *WhatsAppClient) recordNewsletterTerminalReceipt(
 	meta := portal.Metadata.(*waid.PortalMetadata)
 	previousWatermark := meta.LastNewsletterServerID
 	previousPending := slices.Clone(meta.NewsletterPendingServerIDs)
-	previousFailures := maps.Clone(meta.NewsletterUndecodableFailures)
+	previousFailures := meta.GetNewsletterUndecodableFailures()
 	next := int64(serverID)
 	if (meta.NewsletterWatermarkVersion >= newsletterWatermarkVersion && next <= meta.LastNewsletterServerID) ||
 		slices.Contains(meta.NewsletterPendingServerIDs, next) {
@@ -1000,14 +1008,16 @@ func (wa *WhatsAppClient) recordNewsletterTerminalReceipt(
 	if meta.NewsletterWatermarkVersion >= newsletterWatermarkVersion {
 		advanceNewsletterPendingReceipts(meta)
 	}
-	delete(meta.NewsletterUndecodableFailures, next)
-	if len(meta.NewsletterUndecodableFailures) == 0 {
-		meta.NewsletterUndecodableFailures = nil
+	updatedFailures := maps.Clone(previousFailures)
+	delete(updatedFailures, next)
+	if len(updatedFailures) == 0 {
+		updatedFailures = nil
 	}
+	meta.SetNewsletterUndecodableFailures(updatedFailures)
 	if err = portal.Save(ctx); err != nil {
 		meta.LastNewsletterServerID = previousWatermark
 		meta.NewsletterPendingServerIDs = previousPending
-		meta.NewsletterUndecodableFailures = previousFailures
+		meta.SetNewsletterUndecodableFailures(previousFailures)
 		return false, len(previousPending), err
 	}
 	wa.UserLogin.Log.Debug().Stringer("newsletter_jid", jid).
