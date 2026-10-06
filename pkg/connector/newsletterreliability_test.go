@@ -492,7 +492,39 @@ func TestNewsletterLegacyRecoveryEmptyHistoryStaysPending(t *testing.T) {
 	}
 }
 
-func TestNewsletterLegacyRecoveryWithoutDurableAnchorReplaysHistory(t *testing.T) {
+func TestNewsletterLegacyRecoveryWithoutAnchorBelowWatermarkStaysPending(t *testing.T) {
+	wa, portal := newNewsletterReliabilityTestClient(t)
+	jid := types.NewJID("12345", types.NewsletterServer)
+	setNewsletterTestState(t, portal, 407, 0)
+
+	newerDurable := make([]*types.NewsletterMessage, 0, 10)
+	for serverID := types.MessageServerID(417); serverID >= 408; serverID-- {
+		message := testNewsletterMessage(serverID)
+		newerDurable = append(newerDurable, message)
+		if err := wa.Main.Bridge.DB.Message.Insert(context.Background(), &database.Message{
+			ID: waid.MakeMessageID(jid, jid, message.MessageID), MXID: id.EventID(fmt.Sprintf("$durable-%d", serverID)), Room: portal.PortalKey, Timestamp: message.Timestamp, Metadata: &waid.MessageMetadata{},
+		}); err != nil {
+			t.Fatalf("insert newer durable message %d: %v", serverID, err)
+		}
+	}
+	api := &newsletterTestAPI{pages: map[types.MessageServerID][]*types.NewsletterMessage{
+		0: newerDurable,
+	}}
+
+	_, messages, scan, err := wa.prepareNewsletterCatchup(context.Background(), api, jid, 10)
+	if err != nil || len(messages) != 0 {
+		t.Fatalf("no-anchor legacy history result messages=%v scan=%+v err=%v", messages, scan, err)
+	}
+	if !scan.pending || scan.boundedBy != "anchor_not_found" || len(api.requests) != 2 || api.requests[1].Before != 408 {
+		t.Fatalf("legacy history without proven anchor was not retained: requests=%+v scan=%+v", api.requests, scan)
+	}
+	meta := portal.Metadata.(*waid.PortalMetadata)
+	if meta.NewsletterWatermarkVersion != 0 || meta.LastNewsletterServerID != 407 || meta.NewsletterRecoveryBefore != 408 {
+		t.Fatalf("no-anchor history promoted legacy state: version=%d watermark=%d recovery_before=%d", meta.NewsletterWatermarkVersion, meta.LastNewsletterServerID, meta.NewsletterRecoveryBefore)
+	}
+}
+
+func TestNewsletterLegacyRecoveryWithoutDurableAnchorStaysPendingWhileReplayingHistory(t *testing.T) {
 	wa, portal := newNewsletterReliabilityTestClient(t)
 	jid := types.NewJID("12345", types.NewsletterServer)
 	setNewsletterTestState(t, portal, 407, 0)
@@ -500,12 +532,12 @@ func TestNewsletterLegacyRecoveryWithoutDurableAnchorReplaysHistory(t *testing.T
 		0: {testNewsletterMessage(402), testNewsletterMessage(401), testNewsletterMessage(400)},
 	}}
 	_, messages, scan, err := wa.prepareNewsletterCatchup(context.Background(), api, jid, 10)
-	if err != nil || !scan.historyEnd || len(messages) != 3 {
-		t.Fatalf("anchorless legacy recovery did not replay history: messages=%v scan=%+v err=%v", messages, scan, err)
+	if err != nil || !scan.historyEnd || !scan.pending || scan.boundedBy != "anchor_not_found" || len(messages) != 3 {
+		t.Fatalf("anchorless legacy recovery did not remain pending while replaying history: messages=%v scan=%+v err=%v", messages, scan, err)
 	}
 	meta := portal.Metadata.(*waid.PortalMetadata)
-	if meta.NewsletterWatermarkVersion != newsletterWatermarkVersion || meta.LastNewsletterServerID != 399 {
-		t.Fatalf("anchorless recovery state version=%d watermark=%d, want %d/399", meta.NewsletterWatermarkVersion, meta.LastNewsletterServerID, newsletterWatermarkVersion)
+	if meta.NewsletterWatermarkVersion != 0 || meta.LastNewsletterServerID != 407 || meta.NewsletterRecoveryBefore != 400 {
+		t.Fatalf("anchorless recovery state version=%d watermark=%d recovery_before=%d, want 0/407/400", meta.NewsletterWatermarkVersion, meta.LastNewsletterServerID, meta.NewsletterRecoveryBefore)
 	}
 }
 

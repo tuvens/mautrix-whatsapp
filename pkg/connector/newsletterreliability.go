@@ -511,13 +511,21 @@ func (wa *WhatsAppClient) prepareNewsletterCatchup(
 	if err != nil {
 		return state, nil, scan, err
 	}
-	if legacyRecovery && scan.historyEnd && scan.items == 0 {
-		scan.pending = true
-		scan.boundedBy = "history_empty"
+	if legacyRecovery && scan.boundaryMessage == nil {
+		if !scan.pending {
+			scan.pending = true
+			if scan.historyEnd && scan.items == 0 {
+				scan.boundedBy = "history_empty"
+			} else {
+				scan.boundedBy = "anchor_not_found"
+			}
+		}
 		wa.UserLogin.Log.Warn().
 			Stringer("newsletter_jid", jid).
 			Int64("legacy_watermark", state.watermark).
-			Msg("Legacy newsletter recovery returned empty history; keeping migration pending")
+			Str("pending_reason", scan.boundedBy).
+			Int("history_items", scan.items).
+			Msg("Legacy newsletter recovery has no proven durable anchor; keeping migration pending")
 	}
 	if scan.pending {
 		var recoveredDurableIDs []int64
