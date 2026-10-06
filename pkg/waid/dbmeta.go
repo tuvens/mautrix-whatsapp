@@ -122,16 +122,17 @@ type ReactionMetadata struct {
 }
 
 type PortalMetadata struct {
-	DisappearingTimerSetAt     int64                `json:"disappearing_timer_set_at,omitempty"`
-	TopicID                    string               `json:"topic_id,omitempty"`
-	LastSync                   jsontime.Unix        `json:"last_sync,omitempty"`
-	CommunityAnnouncementGroup bool                 `json:"is_cag,omitempty"`
-	AddressingMode             types.AddressingMode `json:"addressing_mode,omitempty"`
-	LIDMigrationAttempted      bool                 `json:"lid_migration_attempted,omitempty"`
-	LastNewsletterServerID     int64                `json:"last_newsletter_server_id,omitempty"`
-	NewsletterWatermarkVersion int                  `json:"newsletter_watermark_version,omitempty"`
-	NewsletterPendingServerIDs []int64              `json:"newsletter_pending_server_ids,omitempty"`
-	NewsletterRecoveryBefore   int64                `json:"newsletter_recovery_before,omitempty"`
+	DisappearingTimerSetAt        int64                `json:"disappearing_timer_set_at,omitempty"`
+	TopicID                       string               `json:"topic_id,omitempty"`
+	LastSync                      jsontime.Unix        `json:"last_sync,omitempty"`
+	CommunityAnnouncementGroup    bool                 `json:"is_cag,omitempty"`
+	AddressingMode                types.AddressingMode `json:"addressing_mode,omitempty"`
+	LIDMigrationAttempted         bool                 `json:"lid_migration_attempted,omitempty"`
+	LastNewsletterServerID        int64                `json:"last_newsletter_server_id,omitempty"`
+	NewsletterWatermarkVersion    int                  `json:"newsletter_watermark_version,omitempty"`
+	NewsletterPendingServerIDs    []int64              `json:"newsletter_pending_server_ids,omitempty"`
+	NewsletterRecoveryBefore      int64                `json:"newsletter_recovery_before,omitempty"`
+	NewsletterUndecodableFailures map[int64]int        `json:"newsletter_undecodable_failures,omitempty"`
 }
 
 type GhostMetadata struct {
