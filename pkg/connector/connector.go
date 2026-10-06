@@ -62,9 +62,10 @@ type WhatsAppConnector struct {
 	firstClientConnectOnce sync.Once
 	backgroundConnectOnce  sync.Once
 
-	mediaEditCache         MediaEditCache
-	mediaEditCacheLock     sync.RWMutex
-	stopMediaEditCacheLoop atomic.Pointer[context.CancelFunc]
+	mediaEditCache          MediaEditCache
+	mediaEditCacheLock      sync.RWMutex
+	stopMediaEditCacheLoop  atomic.Pointer[context.CancelFunc]
+	newsletterWatermarkLock sync.Mutex
 }
 
 func init() {

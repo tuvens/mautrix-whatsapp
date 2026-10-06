@@ -123,7 +123,6 @@ type WhatsAppClient struct {
 
 	appStateRecoveryLock      sync.Mutex
 	appStateFullSyncAttempted map[appstate.WAPatchName]time.Time
-	newsletterWatermarkLock   sync.Mutex
 }
 
 var (

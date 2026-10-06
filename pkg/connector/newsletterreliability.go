@@ -530,8 +530,8 @@ func newsletterMessageEvent(jid types.JID, message *types.NewsletterMessage) *ev
 }
 
 func (wa *WhatsAppClient) getNewsletterWatermark(ctx context.Context, jid types.JID) (int64, error) {
-	wa.newsletterWatermarkLock.Lock()
-	defer wa.newsletterWatermarkLock.Unlock()
+	wa.Main.newsletterWatermarkLock.Lock()
+	defer wa.Main.newsletterWatermarkLock.Unlock()
 	portal, err := wa.Main.Bridge.GetPortalByKey(ctx, wa.makeWAPortalKey(jid))
 	if err != nil {
 		return 0, err
@@ -540,8 +540,8 @@ func (wa *WhatsAppClient) getNewsletterWatermark(ctx context.Context, jid types.
 }
 
 func (wa *WhatsAppClient) getNewsletterCatchupState(ctx context.Context, jid types.JID) (newsletterCatchupState, error) {
-	wa.newsletterWatermarkLock.Lock()
-	defer wa.newsletterWatermarkLock.Unlock()
+	wa.Main.newsletterWatermarkLock.Lock()
+	defer wa.Main.newsletterWatermarkLock.Unlock()
 	portal, err := wa.Main.Bridge.GetPortalByKey(ctx, wa.makeWAPortalKey(jid))
 	if err != nil {
 		return newsletterCatchupState{}, err
@@ -666,8 +666,8 @@ func (wa *WhatsAppClient) commitNewsletterCatchupState(
 	recoveryBefore types.MessageServerID,
 	recoveredDurableIDs []int64,
 ) error {
-	wa.newsletterWatermarkLock.Lock()
-	defer wa.newsletterWatermarkLock.Unlock()
+	wa.Main.newsletterWatermarkLock.Lock()
+	defer wa.Main.newsletterWatermarkLock.Unlock()
 	portal, err := wa.Main.Bridge.GetPortalByKey(ctx, wa.makeWAPortalKey(jid))
 	if err != nil {
 		return err
@@ -788,6 +788,15 @@ func newsletterQuarantineFilename(jid types.JID, serverID types.MessageServerID)
 	return fmt.Sprintf("server-%d_%s.bin", serverID, safeJID)
 }
 
+func syncNewsletterDirectory(root *os.Root) error {
+	dir, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
 func (wa *WhatsAppClient) writeNewsletterQuarantineEnvelope(
 	jid types.JID,
 	message *newsletterFetchedMessage,
@@ -805,6 +814,9 @@ func (wa *WhatsAppClient) writeNewsletterQuarantineEnvelope(
 	defer runtimeRoot.Close()
 	if err = runtimeRoot.MkdirAll(newsletterQuarantineDir, 0o700); err != nil {
 		return "", fmt.Errorf("create quarantine directory: %w", err)
+	}
+	if err = syncNewsletterDirectory(runtimeRoot); err != nil {
+		return "", fmt.Errorf("sync bridge runtime data directory: %w", err)
 	}
 	quarantineRoot, err := runtimeRoot.OpenRoot(newsletterQuarantineDir)
 	if err != nil {
@@ -841,6 +853,9 @@ func (wa *WhatsAppClient) writeNewsletterQuarantineEnvelope(
 		return "", fmt.Errorf("publish quarantine file: %w", err)
 	}
 	published = true
+	if err = syncNewsletterDirectory(quarantineRoot); err != nil {
+		return "", fmt.Errorf("sync quarantine directory: %w", err)
+	}
 	return filepath.Join(wa.Main.RuntimeDataDir, newsletterQuarantineDir, destinationName), nil
 }
 
@@ -853,8 +868,8 @@ func (wa *WhatsAppClient) recordNewsletterUndecodableFailure(
 	if err != nil {
 		return false, err
 	}
-	wa.newsletterWatermarkLock.Lock()
-	defer wa.newsletterWatermarkLock.Unlock()
+	wa.Main.newsletterWatermarkLock.Lock()
+	defer wa.Main.newsletterWatermarkLock.Unlock()
 	meta := portal.Metadata.(*waid.PortalMetadata)
 	previousFailures := maps.Clone(meta.NewsletterUndecodableFailures)
 	if meta.NewsletterUndecodableFailures == nil {
@@ -937,8 +952,8 @@ func (wa *WhatsAppClient) clearNewsletterUndecodableFailure(
 	if err != nil {
 		return err
 	}
-	wa.newsletterWatermarkLock.Lock()
-	defer wa.newsletterWatermarkLock.Unlock()
+	wa.Main.newsletterWatermarkLock.Lock()
+	defer wa.Main.newsletterWatermarkLock.Unlock()
 	meta := portal.Metadata.(*waid.PortalMetadata)
 	key := int64(serverID)
 	if _, exists := meta.NewsletterUndecodableFailures[key]; !exists {
@@ -966,8 +981,8 @@ func (wa *WhatsAppClient) recordNewsletterTerminalReceipt(
 	serverID types.MessageServerID,
 	receiptType string,
 ) (advanced bool, pending int, err error) {
-	wa.newsletterWatermarkLock.Lock()
-	defer wa.newsletterWatermarkLock.Unlock()
+	wa.Main.newsletterWatermarkLock.Lock()
+	defer wa.Main.newsletterWatermarkLock.Unlock()
 	meta := portal.Metadata.(*waid.PortalMetadata)
 	previousWatermark := meta.LastNewsletterServerID
 	previousPending := slices.Clone(meta.NewsletterPendingServerIDs)
