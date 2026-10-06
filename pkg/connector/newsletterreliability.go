@@ -392,10 +392,6 @@ func scanNewsletterCatchup(
 		result.oldest = oldest
 		result.nextBefore = oldest
 		if reachedBoundary {
-			boundaryID := result.boundaryMessage.MessageServerID
-			result.messages = slices.DeleteFunc(result.messages, func(message *types.NewsletterMessage) bool {
-				return message.MessageServerID <= boundaryID
-			})
 			break
 		}
 		if len(messages) < requestCount {
@@ -488,17 +484,22 @@ func (wa *WhatsAppClient) prepareNewsletterCatchup(
 		if err = wa.commitNewsletterCatchupState(ctx, jid, state, state.version, state.watermark, scan.nextBefore, nil); err != nil {
 			return state, nil, scan, fmt.Errorf("persist bounded recovery cursor: %w", err)
 		}
-		return state, nil, scan, nil
+		return state, scan.messages, scan, nil
 	}
 
 	newVersion := state.version
 	newWatermark := state.watermark
 	if legacyRecovery {
-		if scan.boundaryMessage == nil {
+		if scan.boundaryMessage == nil && !scan.historyEnd {
 			return state, nil, scan, fmt.Errorf("legacy newsletter watermark %d has no durable receipt in bounded history", state.watermark)
 		}
 		newVersion = newsletterWatermarkVersion
-		newWatermark = int64(scan.boundaryMessage.MessageServerID) - 1
+		if scan.oldest > 0 {
+			// Re-anchor below every item inspected in the terminating page. A
+			// newer durable row is retained as pending rather than being used to
+			// skip an older, non-durable gap on the same page.
+			newWatermark = int64(scan.oldest) - 1
+		}
 	} else if initialHistory {
 		if !scan.historyEnd {
 			return state, nil, scan, fmt.Errorf("initial newsletter history did not reach a durable boundary")
@@ -551,15 +552,14 @@ func (wa *WhatsAppClient) commitNewsletterCatchupState(
 			meta.NewsletterPendingServerIDs = append(meta.NewsletterPendingServerIDs, serverID)
 		}
 	}
-	if len(meta.NewsletterPendingServerIDs) > newsletterMaxPending {
-		meta.NewsletterWatermarkVersion = previousVersion
-		meta.LastNewsletterServerID = previousWatermark
-		meta.NewsletterRecoveryBefore = previousBefore
-		meta.NewsletterPendingServerIDs = previousPending
-		return fmt.Errorf("newsletter pending receipt ledger reached bounded %d-item cap", newsletterMaxPending)
-	}
 	if meta.NewsletterWatermarkVersion >= newsletterWatermarkVersion {
 		advanceNewsletterPendingReceipts(meta)
+	}
+	if len(meta.NewsletterPendingServerIDs) > newsletterMaxPending {
+		// Keep the receipts nearest the frontier. Higher durable IDs are safe to
+		// forget here: after the continuation resets, bounded history refetches
+		// them and bridge message identity makes that replay idempotent.
+		meta.NewsletterPendingServerIDs = meta.NewsletterPendingServerIDs[:newsletterMaxPending]
 	}
 	if err = portal.Save(ctx); err != nil {
 		meta.NewsletterWatermarkVersion = previousVersion
@@ -617,7 +617,8 @@ func (wa *WhatsAppClient) recordNewsletterDurableReceipt(
 		slices.Contains(meta.NewsletterPendingServerIDs, next) {
 		return false, len(meta.NewsletterPendingServerIDs), nil
 	}
-	if len(meta.NewsletterPendingServerIDs) >= newsletterMaxPending {
+	gapClosing := meta.NewsletterWatermarkVersion >= newsletterWatermarkVersion && next == meta.LastNewsletterServerID+1
+	if len(meta.NewsletterPendingServerIDs) >= newsletterMaxPending && !gapClosing {
 		return false, len(meta.NewsletterPendingServerIDs), fmt.Errorf("newsletter pending receipt ledger reached bounded %d-item cap", newsletterMaxPending)
 	}
 	meta.NewsletterPendingServerIDs = append(meta.NewsletterPendingServerIDs, next)

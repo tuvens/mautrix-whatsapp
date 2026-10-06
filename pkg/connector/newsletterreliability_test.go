@@ -382,8 +382,8 @@ func TestNewsletterBoundedRecoveryCursorPersistsAcrossPasses(t *testing.T) {
 	pages[before] = []*types.NewsletterMessage{testNewsletterMessage(serverID), testNewsletterMessage(1)}
 	api := &newsletterTestAPI{pages: pages}
 	_, messages, scan, err := wa.prepareNewsletterCatchup(context.Background(), api, jid, 100)
-	if err != nil || len(messages) != 0 || !scan.pending || scan.boundedBy != "items" {
-		t.Fatalf("first bounded pass messages=%d scan=%+v err=%v", len(messages), scan, err)
+	if err != nil || len(messages) != newsletterMaxPollItems || !scan.pending || scan.boundedBy != "items" {
+		t.Fatalf("first bounded pass omitted checkpointed candidates: messages=%d scan=%+v err=%v", len(messages), scan, err)
 	}
 	meta := portal.Metadata.(*waid.PortalMetadata)
 	if meta.NewsletterRecoveryBefore != int64(before) {
@@ -395,6 +395,93 @@ func TestNewsletterBoundedRecoveryCursorPersistsAcrossPasses(t *testing.T) {
 	}
 	if meta.NewsletterRecoveryBefore != 0 {
 		t.Fatalf("completed recovery left cursor %d, want 0", meta.NewsletterRecoveryBefore)
+	}
+}
+
+func TestNewsletterLegacyRecoveryPreservesGapBelowNewerDurableReceipt(t *testing.T) {
+	wa, portal := newNewsletterReliabilityTestClient(t)
+	jid := types.NewJID("12345", types.NewsletterServer)
+	setNewsletterTestState(t, portal, 407, 0)
+	durable := testNewsletterMessage(407)
+	if err := wa.Main.Bridge.DB.Message.Insert(context.Background(), &database.Message{
+		ID: waid.MakeMessageID(jid, jid, durable.MessageID), MXID: "$durable-407", Room: portal.PortalKey, Timestamp: durable.Timestamp, Metadata: &waid.MessageMetadata{},
+	}); err != nil {
+		t.Fatalf("insert newer durable message: %v", err)
+	}
+	api := &newsletterTestAPI{pages: map[types.MessageServerID][]*types.NewsletterMessage{
+		0: {durable, testNewsletterMessage(406)},
+	}}
+	_, messages, scan, err := wa.prepareNewsletterCatchup(context.Background(), api, jid, 10)
+	if err != nil || scan.pending || len(messages) != 1 || messages[0].MessageServerID != 406 {
+		t.Fatalf("newer durable receipt hid legacy gap: messages=%v scan=%+v err=%v", messages, scan, err)
+	}
+	meta := portal.Metadata.(*waid.PortalMetadata)
+	if meta.LastNewsletterServerID != 405 || len(meta.NewsletterPendingServerIDs) != 1 || meta.NewsletterPendingServerIDs[0] != 407 {
+		t.Fatalf("legacy gap state watermark=%d pending=%v, want 405/[407]", meta.LastNewsletterServerID, meta.NewsletterPendingServerIDs)
+	}
+}
+
+func TestNewsletterLegacyRecoveryWithoutDurableAnchorReplaysHistory(t *testing.T) {
+	wa, portal := newNewsletterReliabilityTestClient(t)
+	jid := types.NewJID("12345", types.NewsletterServer)
+	setNewsletterTestState(t, portal, 407, 0)
+	api := &newsletterTestAPI{pages: map[types.MessageServerID][]*types.NewsletterMessage{
+		0: {testNewsletterMessage(402), testNewsletterMessage(401), testNewsletterMessage(400)},
+	}}
+	_, messages, scan, err := wa.prepareNewsletterCatchup(context.Background(), api, jid, 10)
+	if err != nil || !scan.historyEnd || len(messages) != 3 {
+		t.Fatalf("anchorless legacy recovery did not replay history: messages=%v scan=%+v err=%v", messages, scan, err)
+	}
+	meta := portal.Metadata.(*waid.PortalMetadata)
+	if meta.NewsletterWatermarkVersion != newsletterWatermarkVersion || meta.LastNewsletterServerID != 399 {
+		t.Fatalf("anchorless recovery state version=%d watermark=%d, want %d/399", meta.NewsletterWatermarkVersion, meta.LastNewsletterServerID, newsletterWatermarkVersion)
+	}
+}
+
+func TestNewsletterGapClosingReceiptDrainsFullPendingLedger(t *testing.T) {
+	wa, portal := newNewsletterReliabilityTestClient(t)
+	jid := types.NewJID("12345", types.NewsletterServer)
+	setNewsletterTestState(t, portal, 1, newsletterWatermarkVersion)
+	meta := portal.Metadata.(*waid.PortalMetadata)
+	for serverID := int64(3); serverID < 3+newsletterMaxPending; serverID++ {
+		meta.NewsletterPendingServerIDs = append(meta.NewsletterPendingServerIDs, serverID)
+	}
+	if err := portal.Save(context.Background()); err != nil {
+		t.Fatalf("save full pending ledger: %v", err)
+	}
+	advanced, pending, err := wa.recordNewsletterDurableReceipt(context.Background(), portal, jid, 2)
+	if err != nil || !advanced || pending != 0 || meta.LastNewsletterServerID != 2+newsletterMaxPending {
+		t.Fatalf("gap-closing receipt failed to drain full ledger: watermark=%d pending=%d advanced=%t err=%v", meta.LastNewsletterServerID, pending, advanced, err)
+	}
+}
+
+func TestNewsletterLegacyMigrationKeepsFullLedgerRecoverable(t *testing.T) {
+	wa, portal := newNewsletterReliabilityTestClient(t)
+	jid := types.NewJID("12345", types.NewsletterServer)
+	setNewsletterTestState(t, portal, 2000, 0)
+	meta := portal.Metadata.(*waid.PortalMetadata)
+	for serverID := int64(1001); serverID <= 2000; serverID++ {
+		meta.NewsletterPendingServerIDs = append(meta.NewsletterPendingServerIDs, serverID)
+	}
+	durable := testNewsletterMessage(1000)
+	if err := wa.Main.Bridge.DB.Message.Insert(context.Background(), &database.Message{
+		ID: waid.MakeMessageID(jid, jid, durable.MessageID), MXID: "$durable-1000", Room: portal.PortalKey, Timestamp: durable.Timestamp, Metadata: &waid.MessageMetadata{},
+	}); err != nil {
+		t.Fatalf("insert migration boundary: %v", err)
+	}
+	api := &newsletterTestAPI{pages: map[types.MessageServerID][]*types.NewsletterMessage{
+		0: {durable, testNewsletterMessage(999)},
+	}}
+	_, messages, _, err := wa.prepareNewsletterCatchup(context.Background(), api, jid, 10)
+	if err != nil || len(messages) != 1 || messages[0].MessageServerID != 999 {
+		t.Fatalf("full-ledger migration failed: messages=%v err=%v", messages, err)
+	}
+	if meta.NewsletterWatermarkVersion != newsletterWatermarkVersion || meta.LastNewsletterServerID != 998 || len(meta.NewsletterPendingServerIDs) != newsletterMaxPending || meta.NewsletterPendingServerIDs[0] != 1000 {
+		t.Fatalf("migration state version=%d watermark=%d pending=%d first=%d", meta.NewsletterWatermarkVersion, meta.LastNewsletterServerID, len(meta.NewsletterPendingServerIDs), meta.NewsletterPendingServerIDs[0])
+	}
+	advanced, pending, err := wa.recordNewsletterDurableReceipt(context.Background(), portal, jid, 999)
+	if err != nil || !advanced || pending != 0 || meta.LastNewsletterServerID != 1999 {
+		t.Fatalf("migration gap close watermark=%d pending=%d advanced=%t err=%v", meta.LastNewsletterServerID, pending, advanced, err)
 	}
 }
 
