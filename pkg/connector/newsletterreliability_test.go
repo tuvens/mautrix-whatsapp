@@ -421,6 +421,77 @@ func TestNewsletterLegacyRecoveryPreservesGapBelowNewerDurableReceipt(t *testing
 	}
 }
 
+func TestNewsletterLegacyRecoveryScansPastFullPageOfNewerDurableRows(t *testing.T) {
+	wa, portal := newNewsletterReliabilityTestClient(t)
+	jid := types.NewJID("12345", types.NewsletterServer)
+	setNewsletterTestState(t, portal, 407, 0)
+
+	newerDurable := make([]*types.NewsletterMessage, 0, 10)
+	for serverID := types.MessageServerID(417); serverID >= 408; serverID-- {
+		message := testNewsletterMessage(serverID)
+		newerDurable = append(newerDurable, message)
+		if err := wa.Main.Bridge.DB.Message.Insert(context.Background(), &database.Message{
+			ID: waid.MakeMessageID(jid, jid, message.MessageID), MXID: id.EventID(fmt.Sprintf("$durable-%d", serverID)), Room: portal.PortalKey, Timestamp: message.Timestamp, Metadata: &waid.MessageMetadata{},
+		}); err != nil {
+			t.Fatalf("insert newer durable message %d: %v", serverID, err)
+		}
+	}
+	durableAnchor := testNewsletterMessage(399)
+	if err := wa.Main.Bridge.DB.Message.Insert(context.Background(), &database.Message{
+		ID: waid.MakeMessageID(jid, jid, durableAnchor.MessageID), MXID: "$durable-399", Room: portal.PortalKey, Timestamp: durableAnchor.Timestamp, Metadata: &waid.MessageMetadata{},
+	}); err != nil {
+		t.Fatalf("insert durable anchor: %v", err)
+	}
+	gapPage := make([]*types.NewsletterMessage, 0, 9)
+	for serverID := types.MessageServerID(407); serverID >= 400; serverID-- {
+		gapPage = append(gapPage, testNewsletterMessage(serverID))
+	}
+	gapPage = append(gapPage, durableAnchor)
+	api := &newsletterTestAPI{pages: map[types.MessageServerID][]*types.NewsletterMessage{
+		0:   newerDurable,
+		408: gapPage,
+	}}
+
+	_, messages, scan, err := wa.prepareNewsletterCatchup(context.Background(), api, jid, 10)
+	if err != nil {
+		t.Fatalf("recover below newer durable page: %v", err)
+	}
+	if scan.pending || len(api.requests) != 2 || api.requests[1].Before != 408 {
+		t.Fatalf("legacy recovery stopped above gap: requests=%+v scan=%+v", api.requests, scan)
+	}
+	if len(messages) != 8 {
+		t.Fatalf("recovered %d messages, want exactly 400-407", len(messages))
+	}
+	for i, message := range messages {
+		if want := types.MessageServerID(400 + i); message.MessageServerID != want {
+			t.Fatalf("recovered message %d has server ID %d, want %d", i, message.MessageServerID, want)
+		}
+	}
+	meta := portal.Metadata.(*waid.PortalMetadata)
+	if meta.NewsletterWatermarkVersion != newsletterWatermarkVersion || meta.LastNewsletterServerID != 399 {
+		t.Fatalf("legacy recovery state version=%d watermark=%d, want %d/399", meta.NewsletterWatermarkVersion, meta.LastNewsletterServerID, newsletterWatermarkVersion)
+	}
+}
+
+func TestNewsletterLegacyRecoveryEmptyHistoryStaysPending(t *testing.T) {
+	wa, portal := newNewsletterReliabilityTestClient(t)
+	jid := types.NewJID("12345", types.NewsletterServer)
+	setNewsletterTestState(t, portal, 407, 0)
+	api := &newsletterTestAPI{pages: map[types.MessageServerID][]*types.NewsletterMessage{}}
+
+	_, messages, scan, err := wa.prepareNewsletterCatchup(context.Background(), api, jid, 10)
+	if err != nil || len(messages) != 0 {
+		t.Fatalf("empty legacy history result messages=%v scan=%+v err=%v", messages, scan, err)
+	}
+	if !scan.pending || scan.boundedBy != "history_empty" {
+		t.Fatalf("empty legacy history was not retained as pending: scan=%+v", scan)
+	}
+	meta := portal.Metadata.(*waid.PortalMetadata)
+	if meta.NewsletterWatermarkVersion != 0 || meta.LastNewsletterServerID != 407 || meta.NewsletterRecoveryBefore != 0 {
+		t.Fatalf("empty history promoted legacy state: version=%d watermark=%d recovery_before=%d", meta.NewsletterWatermarkVersion, meta.LastNewsletterServerID, meta.NewsletterRecoveryBefore)
+	}
+}
+
 func TestNewsletterLegacyRecoveryWithoutDurableAnchorReplaysHistory(t *testing.T) {
 	wa, portal := newNewsletterReliabilityTestClient(t)
 	jid := types.NewJID("12345", types.NewsletterServer)

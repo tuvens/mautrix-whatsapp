@@ -273,6 +273,7 @@ type newsletterCatchupScan struct {
 }
 
 type newsletterCatchupBoundary func(*types.NewsletterMessage) (bool, error)
+type newsletterCatchupBoundaryStop func(*types.NewsletterMessage, bool) bool
 
 func collectNewsletterCatchup(ctx context.Context, api newsletterAPI, jid types.JID, watermark int64, count int) ([]*types.NewsletterMessage, error) {
 	scan, err := scanNewsletterCatchup(
@@ -299,9 +300,27 @@ func scanNewsletterCatchup(
 	deadline time.Time,
 	boundary newsletterCatchupBoundary,
 ) (newsletterCatchupScan, error) {
+	return scanNewsletterCatchupWithStop(ctx, api, jid, before, count, maxPages, maxItems, deadline, boundary, nil)
+}
+
+func scanNewsletterCatchupWithStop(
+	ctx context.Context,
+	api newsletterAPI,
+	jid types.JID,
+	before types.MessageServerID,
+	count int,
+	maxPages int,
+	maxItems int,
+	deadline time.Time,
+	boundary newsletterCatchupBoundary,
+	stopAtBoundary newsletterCatchupBoundaryStop,
+) (newsletterCatchupScan, error) {
 	result := newsletterCatchupScan{nextBefore: before}
 	if count <= 0 {
 		return result, fmt.Errorf("newsletter history count must be positive")
+	}
+	if stopAtBoundary == nil {
+		stopAtBoundary = func(_ *types.NewsletterMessage, atBoundary bool) bool { return atBoundary }
 	}
 	seen := make(map[struct {
 		serverID  types.MessageServerID
@@ -370,11 +389,13 @@ func scanNewsletterCatchup(
 				return result, err
 			}
 			if atBoundary {
-				if result.boundaryMessage == nil || message.MessageServerID < result.boundaryMessage.MessageServerID {
-					result.boundaryMessage = message
-				}
 				result.boundaryIDs = append(result.boundaryIDs, int64(message.MessageServerID))
-				reachedBoundary = true
+				if stopAtBoundary(message, true) {
+					if result.boundaryMessage == nil || message.MessageServerID < result.boundaryMessage.MessageServerID {
+						result.boundaryMessage = message
+					}
+					reachedBoundary = true
+				}
 				continue
 			}
 			key := struct {
@@ -472,16 +493,38 @@ func (wa *WhatsAppClient) prepareNewsletterCatchup(
 	} else if initialHistory {
 		boundary = func(*types.NewsletterMessage) (bool, error) { return false, nil }
 	}
-	scan, err := scanNewsletterCatchup(
+	stopAtBoundary := newsletterCatchupBoundaryStop(nil)
+	if legacyRecovery {
+		// A durable post newer than a legacy queue-accepted watermark is not a
+		// safe migration anchor: the missing interval may be on an older page.
+		// Keep scanning until durability is proven at or below the legacy
+		// watermark, or retain the bounded continuation for the next pass.
+		stopAtBoundary = func(message *types.NewsletterMessage, durable bool) bool {
+			return durable && int64(message.MessageServerID) <= state.watermark
+		}
+	}
+	scan, err := scanNewsletterCatchupWithStop(
 		ctx, api, jid, state.recoveryBefore, count,
 		newsletterMaxPollPages, newsletterMaxPollItems,
-		time.Now().Add(newsletterMaxPollDuration), boundary,
+		time.Now().Add(newsletterMaxPollDuration), boundary, stopAtBoundary,
 	)
 	if err != nil {
 		return state, nil, scan, err
 	}
+	if legacyRecovery && scan.historyEnd && scan.items == 0 {
+		scan.pending = true
+		scan.boundedBy = "history_empty"
+		wa.UserLogin.Log.Warn().
+			Stringer("newsletter_jid", jid).
+			Int64("legacy_watermark", state.watermark).
+			Msg("Legacy newsletter recovery returned empty history; keeping migration pending")
+	}
 	if scan.pending {
-		if err = wa.commitNewsletterCatchupState(ctx, jid, state, state.version, state.watermark, scan.nextBefore, nil); err != nil {
+		var recoveredDurableIDs []int64
+		if legacyRecovery {
+			recoveredDurableIDs = scan.boundaryIDs
+		}
+		if err = wa.commitNewsletterCatchupState(ctx, jid, state, state.version, state.watermark, scan.nextBefore, recoveredDurableIDs); err != nil {
 			return state, nil, scan, fmt.Errorf("persist bounded recovery cursor: %w", err)
 		}
 		return state, scan.messages, scan, nil
