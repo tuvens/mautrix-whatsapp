@@ -129,6 +129,9 @@ type PortalMetadata struct {
 	AddressingMode             types.AddressingMode `json:"addressing_mode,omitempty"`
 	LIDMigrationAttempted      bool                 `json:"lid_migration_attempted,omitempty"`
 	LastNewsletterServerID     int64                `json:"last_newsletter_server_id,omitempty"`
+	NewsletterWatermarkVersion int                  `json:"newsletter_watermark_version,omitempty"`
+	NewsletterPendingServerIDs []int64              `json:"newsletter_pending_server_ids,omitempty"`
+	NewsletterRecoveryBefore   int64                `json:"newsletter_recovery_before,omitempty"`
 }
 
 type GhostMetadata struct {
