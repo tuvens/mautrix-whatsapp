@@ -2,9 +2,13 @@ package connector
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,6 +37,7 @@ type newsletterTestAPI struct {
 	pages          map[types.MessageServerID][]*types.NewsletterMessage
 	errors         map[types.MessageServerID]error
 	decodeFailures map[types.MessageServerID]bool
+	rawEnvelopes   map[types.MessageServerID][]byte
 }
 
 func (api *newsletterTestAPI) GetSubscribedNewsletters(context.Context) ([]*types.NewsletterMetadata, error) {
@@ -51,6 +56,7 @@ func (api *newsletterTestAPI) GetNewsletterMessages(_ context.Context, _ types.J
 			NewsletterMessage: message,
 			bodyAbsent: message != nil && message.Message == nil &&
 				!api.decodeFailures[message.MessageServerID],
+			rawEnvelope: api.rawEnvelopes[message.MessageServerID],
 		}
 	}
 	return messages, nil
@@ -343,6 +349,173 @@ func TestNewsletterPollDoesNotAcknowledgeDecodeFailure(t *testing.T) {
 	}
 	if got := portal.Metadata.(*waid.PortalMetadata).LastNewsletterServerID; got != 405 {
 		t.Fatalf("protobuf decode failure advanced watermark to %d, want 405", got)
+	}
+}
+
+func TestNewsletterPollQuarantinesThirdConsecutiveDecodeFailureAndContinues(t *testing.T) {
+	wa, portal := newNewsletterReliabilityTestClient(t)
+	jid := types.NewJID("12345", types.NewsletterServer)
+	setNewsletterTestState(t, portal, 405, newsletterWatermarkVersion)
+	wa.Main.Config.NewsletterReliability.PollCount = 10
+	wa.Main.RuntimeDataDir = t.TempDir()
+
+	durable := testNewsletterMessage(405)
+	if err := wa.Main.Bridge.DB.Message.Insert(context.Background(), &database.Message{
+		ID: waid.MakeMessageID(jid, jid, durable.MessageID), MXID: "$durable-405-quarantine", Room: portal.PortalKey, Timestamp: durable.Timestamp, Metadata: &waid.MessageMetadata{},
+	}); err != nil {
+		t.Fatalf("insert durable 405 fixture: %v", err)
+	}
+	undecodable := testNewsletterMessage(406)
+	undecodable.Message = nil
+	bridgeable := testNewsletterMessage(407)
+	text := "recovered after quarantining 406"
+	bridgeable.Message = &waE2E.Message{Conversation: &text}
+	rawEnvelope := []byte("raw-envelope-for-406")
+	api := &newsletterTestAPI{
+		pages: map[types.MessageServerID][]*types.NewsletterMessage{
+			0: {bridgeable, undecodable, durable},
+		},
+		decodeFailures: map[types.MessageServerID]bool{406: true},
+		rawEnvelopes:   map[types.MessageServerID][]byte{406: rawEnvelope},
+	}
+
+	oldBuffer := bridgev2.PortalEventBuffer
+	bridgev2.PortalEventBuffer = 0
+	defer func() { bridgev2.PortalEventBuffer = oldBuffer }()
+	for cycle := 1; cycle <= 2; cycle++ {
+		if err := wa.pollNewsletterChannel(context.Background(), api, jid); err == nil {
+			t.Fatalf("decode failure cycle %d succeeded before quarantine threshold", cycle)
+		}
+		if got := portal.Metadata.(*waid.PortalMetadata).LastNewsletterServerID; got != 405 {
+			t.Fatalf("decode failure cycle %d advanced watermark to %d, want 405", cycle, got)
+		}
+	}
+	if err := wa.pollNewsletterChannel(context.Background(), api, jid); err != nil {
+		t.Fatalf("third consecutive decode failure did not quarantine and continue: %v", err)
+	}
+	if got := portal.Metadata.(*waid.PortalMetadata).LastNewsletterServerID; got != 407 {
+		t.Fatalf("watermark after quarantined 406 and delivered 407 = %d, want 407", got)
+	}
+	quarantinePath := filepath.Join(wa.Main.RuntimeDataDir, "undecodable-newsletters", "server-406_12345@newsletter.bin")
+	gotEnvelope, err := os.ReadFile(quarantinePath)
+	if err != nil {
+		t.Fatalf("read quarantined raw envelope: %v", err)
+	}
+	if string(gotEnvelope) != string(rawEnvelope) {
+		t.Fatalf("quarantined envelope = %q, want %q", gotEnvelope, rawEnvelope)
+	}
+	intent := wa.Main.Bridge.Matrix.(*duplicateTestMatrix).intent
+	if intent.sent != 1 {
+		t.Fatalf("normal server ID 407 delivered %d times, want exactly once", intent.sent)
+	}
+}
+
+func TestNewsletterPollDecodeSuccessAfterTwoFailuresClearsCountAndDelivers(t *testing.T) {
+	wa, portal := newNewsletterReliabilityTestClient(t)
+	jid := types.NewJID("12345", types.NewsletterServer)
+	setNewsletterTestState(t, portal, 405, newsletterWatermarkVersion)
+	wa.Main.Config.NewsletterReliability.PollCount = 10
+	wa.Main.RuntimeDataDir = t.TempDir()
+
+	durable := testNewsletterMessage(405)
+	if err := wa.Main.Bridge.DB.Message.Insert(context.Background(), &database.Message{
+		ID: waid.MakeMessageID(jid, jid, durable.MessageID), MXID: "$durable-405-recovery", Room: portal.PortalKey, Timestamp: durable.Timestamp, Metadata: &waid.MessageMetadata{},
+	}); err != nil {
+		t.Fatalf("insert durable 405 fixture: %v", err)
+	}
+	message := testNewsletterMessage(406)
+	message.Message = nil
+	api := &newsletterTestAPI{
+		pages:          map[types.MessageServerID][]*types.NewsletterMessage{0: {message, durable}},
+		decodeFailures: map[types.MessageServerID]bool{406: true},
+		rawEnvelopes:   map[types.MessageServerID][]byte{406: []byte("raw-envelope-for-recovered-406")},
+	}
+	for cycle := 1; cycle <= 2; cycle++ {
+		if err := wa.pollNewsletterChannel(context.Background(), api, jid); err == nil {
+			t.Fatalf("decode failure cycle %d succeeded before message became decodable", cycle)
+		}
+		metadataJSON, err := json.Marshal(portal.Metadata)
+		if err != nil {
+			t.Fatalf("marshal portal metadata after cycle %d: %v", cycle, err)
+		}
+		wantCount := regexp.MustCompile(fmt.Sprintf(`newsletter_undecodable_failures[^}]*"406":%d`, cycle))
+		if !wantCount.Match(metadataJSON) {
+			t.Fatalf("decode failure cycle %d did not persist per-ID count: %s", cycle, metadataJSON)
+		}
+	}
+	text := "decoded on the third cycle"
+	message.Message = &waE2E.Message{Conversation: &text}
+	delete(api.decodeFailures, 406)
+
+	oldBuffer := bridgev2.PortalEventBuffer
+	bridgev2.PortalEventBuffer = 0
+	defer func() { bridgev2.PortalEventBuffer = oldBuffer }()
+	if err := wa.pollNewsletterChannel(context.Background(), api, jid); err != nil {
+		t.Fatalf("later decode success was not delivered normally: %v", err)
+	}
+	if got := portal.Metadata.(*waid.PortalMetadata).LastNewsletterServerID; got != 406 {
+		t.Fatalf("later decode success advanced watermark to %d, want 406", got)
+	}
+	if _, err := os.Stat(filepath.Join(wa.Main.RuntimeDataDir, "undecodable-newsletters", "server-406_12345@newsletter.bin")); !os.IsNotExist(err) {
+		t.Fatalf("later decode success created quarantine file: %v", err)
+	}
+	metadataJSON, err := json.Marshal(portal.Metadata)
+	if err != nil {
+		t.Fatalf("marshal portal metadata: %v", err)
+	}
+	if regexp.MustCompile(`newsletter_undecodable_failures[^}]*406`).Match(metadataJSON) {
+		t.Fatalf("later decode success retained failure count: %s", metadataJSON)
+	}
+}
+
+func TestNewsletterFailureCountUpdateDoesNotRaceConcurrentPortalSave(t *testing.T) {
+	wa, portal := newNewsletterReliabilityTestClient(t)
+	jid := types.NewJID("12345", types.NewsletterServer)
+	setNewsletterTestState(t, portal, 405, newsletterWatermarkVersion)
+
+	ctx := context.Background()
+	start := make(chan struct{})
+	stop := make(chan struct{})
+	saveErr := make(chan error, 1)
+	var ready sync.WaitGroup
+	ready.Add(1)
+	go func() {
+		ready.Done()
+		<-start
+		for {
+			select {
+			case <-stop:
+				saveErr <- nil
+				return
+			default:
+				if err := portal.Save(ctx); err != nil {
+					saveErr <- err
+					return
+				}
+			}
+		}
+	}()
+	ready.Wait()
+	close(start)
+
+	for serverID := types.MessageServerID(1000); serverID < 1064; serverID++ {
+		quarantined, err := wa.recordNewsletterUndecodableFailure(ctx, jid, &newsletterFetchedMessage{
+			NewsletterMessage: testNewsletterMessage(serverID),
+		})
+		if err != nil {
+			close(stop)
+			<-saveErr
+			t.Fatalf("record failure for server ID %d: %v", serverID, err)
+		}
+		if quarantined {
+			close(stop)
+			<-saveErr
+			t.Fatalf("first failure for server ID %d was quarantined", serverID)
+		}
+	}
+	close(stop)
+	if err := <-saveErr; err != nil {
+		t.Fatalf("concurrent portal save: %v", err)
 	}
 }
 

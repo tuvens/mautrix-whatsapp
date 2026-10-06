@@ -1,6 +1,8 @@
 package main
 
 import (
+	"path/filepath"
+
 	"maunium.net/go/mautrix/bridgev2/matrix/mxmain"
 
 	"go.mau.fi/mautrix-whatsapp/pkg/connector"
@@ -25,5 +27,8 @@ var m = mxmain.BridgeMain{
 
 func main() {
 	m.InitVersion(Tag, Commit, BuildTime)
+	m.PostInit = func() {
+		m.Connector.(*connector.WhatsAppConnector).RuntimeDataDir = filepath.Clean(filepath.Dir(m.ConfigPath))
+	}
 	m.Run()
 }

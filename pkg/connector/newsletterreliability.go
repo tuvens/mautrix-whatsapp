@@ -11,9 +11,13 @@ package connector
 import (
 	"cmp"
 	"context"
+	cryptorand "crypto/rand"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -36,6 +40,8 @@ const (
 	newsletterMinRetryDelay    = time.Minute
 	newsletterMaxRetryDelay    = time.Hour
 	newsletterWatermarkVersion = 1
+	newsletterUndecodableLimit = 3
+	newsletterQuarantineDir    = "undecodable-newsletters"
 )
 
 type newsletterAPI interface {
@@ -46,7 +52,8 @@ type newsletterAPI interface {
 
 type newsletterFetchedMessage struct {
 	*types.NewsletterMessage
-	bodyAbsent bool
+	bodyAbsent  bool
+	rawEnvelope []byte
 }
 
 type whatsmeowNewsletterAPI struct {
@@ -97,9 +104,14 @@ func (api *whatsmeowNewsletterAPI) GetNewsletterMessages(
 			return nil, fmt.Errorf("newsletter message parser returned a nil message at envelope %d", i)
 		}
 		_, hasPlaintext := rawMessages[i].GetOptionalChildByTag("plaintext")
+		rawEnvelope, marshalErr := waBinary.Marshal(rawMessages[i])
+		if marshalErr != nil {
+			return nil, fmt.Errorf("marshal raw newsletter envelope %d: %w", i, marshalErr)
+		}
 		messages[i] = &newsletterFetchedMessage{
 			NewsletterMessage: message,
 			bodyAbsent:        !hasPlaintext,
+			rawEnvelope:       rawEnvelope,
 		}
 	}
 	return messages, nil
@@ -294,7 +306,17 @@ func (wa *WhatsAppClient) pollNewsletterChannel(ctx context.Context, api newslet
 			continue
 		}
 		if message.Message == nil {
+			quarantined, quarantineErr := wa.recordNewsletterUndecodableFailure(ctx, jid, message)
+			if quarantineErr != nil {
+				return fmt.Errorf("record undecodable newsletter server_id %d: %w", message.MessageServerID, quarantineErr)
+			}
+			if quarantined {
+				continue
+			}
 			return fmt.Errorf("newsletter server_id %d contained plaintext that could not be decoded", message.MessageServerID)
+		}
+		if err = wa.clearNewsletterUndecodableFailure(ctx, jid, message.MessageServerID); err != nil {
+			return fmt.Errorf("clear undecodable failure count for server_id %d: %w", message.MessageServerID, err)
 		}
 		evt := newsletterMessageEvent(jid, message.NewsletterMessage)
 		pollCtx := context.WithValue(ctx, newsletterPollDeliveryContextKey{}, true)
@@ -508,8 +530,8 @@ func newsletterMessageEvent(jid types.JID, message *types.NewsletterMessage) *ev
 }
 
 func (wa *WhatsAppClient) getNewsletterWatermark(ctx context.Context, jid types.JID) (int64, error) {
-	wa.newsletterWatermarkLock.Lock()
-	defer wa.newsletterWatermarkLock.Unlock()
+	wa.Main.newsletterWatermarkLock.Lock()
+	defer wa.Main.newsletterWatermarkLock.Unlock()
 	portal, err := wa.Main.Bridge.GetPortalByKey(ctx, wa.makeWAPortalKey(jid))
 	if err != nil {
 		return 0, err
@@ -518,8 +540,8 @@ func (wa *WhatsAppClient) getNewsletterWatermark(ctx context.Context, jid types.
 }
 
 func (wa *WhatsAppClient) getNewsletterCatchupState(ctx context.Context, jid types.JID) (newsletterCatchupState, error) {
-	wa.newsletterWatermarkLock.Lock()
-	defer wa.newsletterWatermarkLock.Unlock()
+	wa.Main.newsletterWatermarkLock.Lock()
+	defer wa.Main.newsletterWatermarkLock.Unlock()
 	portal, err := wa.Main.Bridge.GetPortalByKey(ctx, wa.makeWAPortalKey(jid))
 	if err != nil {
 		return newsletterCatchupState{}, err
@@ -644,8 +666,8 @@ func (wa *WhatsAppClient) commitNewsletterCatchupState(
 	recoveryBefore types.MessageServerID,
 	recoveredDurableIDs []int64,
 ) error {
-	wa.newsletterWatermarkLock.Lock()
-	defer wa.newsletterWatermarkLock.Unlock()
+	wa.Main.newsletterWatermarkLock.Lock()
+	defer wa.Main.newsletterWatermarkLock.Unlock()
 	portal, err := wa.Main.Bridge.GetPortalByKey(ctx, wa.makeWAPortalKey(jid))
 	if err != nil {
 		return err
@@ -752,6 +774,214 @@ func (wa *WhatsAppClient) recordNewsletterNothingToBridgeReceipt(
 	return err
 }
 
+func newsletterQuarantineFilename(jid types.JID, serverID types.MessageServerID) string {
+	safeJID := strings.Map(func(char rune) rune {
+		switch {
+		case char >= 'a' && char <= 'z', char >= 'A' && char <= 'Z', char >= '0' && char <= '9':
+			return char
+		case char == '@', char == '.', char == '-', char == '_':
+			return char
+		default:
+			return '_'
+		}
+	}, jid.String())
+	return fmt.Sprintf("server-%d_%s.bin", serverID, safeJID)
+}
+
+func syncNewsletterDirectory(root *os.Root) error {
+	dir, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
+func (wa *WhatsAppClient) writeNewsletterQuarantineEnvelope(
+	jid types.JID,
+	message *newsletterFetchedMessage,
+) (string, error) {
+	if wa.Main.RuntimeDataDir == "" {
+		return "", fmt.Errorf("bridge runtime data directory is not configured")
+	}
+	if len(message.rawEnvelope) == 0 {
+		return "", fmt.Errorf("raw envelope is empty")
+	}
+	runtimeRoot, err := os.OpenRoot(wa.Main.RuntimeDataDir)
+	if err != nil {
+		return "", fmt.Errorf("open bridge runtime data directory: %w", err)
+	}
+	defer runtimeRoot.Close()
+	if err = runtimeRoot.MkdirAll(newsletterQuarantineDir, 0o700); err != nil {
+		return "", fmt.Errorf("create quarantine directory: %w", err)
+	}
+	if err = syncNewsletterDirectory(runtimeRoot); err != nil {
+		return "", fmt.Errorf("sync bridge runtime data directory: %w", err)
+	}
+	quarantineRoot, err := runtimeRoot.OpenRoot(newsletterQuarantineDir)
+	if err != nil {
+		return "", fmt.Errorf("open quarantine directory: %w", err)
+	}
+	defer quarantineRoot.Close()
+	randomSuffix := make([]byte, 16)
+	if _, err = cryptorand.Read(randomSuffix); err != nil {
+		return "", fmt.Errorf("generate quarantine temp name: %w", err)
+	}
+	tempName := fmt.Sprintf(".undecodable-%x.tmp", randomSuffix)
+	temp, err := quarantineRoot.OpenFile(tempName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", fmt.Errorf("create quarantine temp file: %w", err)
+	}
+	published := false
+	defer func() {
+		_ = temp.Close()
+		if !published {
+			_ = quarantineRoot.Remove(tempName)
+		}
+	}()
+	if _, err = temp.Write(message.rawEnvelope); err != nil {
+		return "", fmt.Errorf("write quarantine temp file: %w", err)
+	}
+	if err = temp.Sync(); err != nil {
+		return "", fmt.Errorf("sync quarantine temp file: %w", err)
+	}
+	if err = temp.Close(); err != nil {
+		return "", fmt.Errorf("close quarantine temp file: %w", err)
+	}
+	destinationName := newsletterQuarantineFilename(jid, message.MessageServerID)
+	if err = quarantineRoot.Rename(tempName, destinationName); err != nil {
+		return "", fmt.Errorf("publish quarantine file: %w", err)
+	}
+	published = true
+	if err = syncNewsletterDirectory(quarantineRoot); err != nil {
+		return "", fmt.Errorf("sync quarantine directory: %w", err)
+	}
+	return filepath.Join(wa.Main.RuntimeDataDir, newsletterQuarantineDir, destinationName), nil
+}
+
+func (wa *WhatsAppClient) recordNewsletterUndecodableFailure(
+	ctx context.Context,
+	jid types.JID,
+	message *newsletterFetchedMessage,
+) (bool, error) {
+	portal, err := wa.Main.Bridge.GetPortalByKey(ctx, wa.makeWAPortalKey(jid))
+	if err != nil {
+		return false, err
+	}
+	wa.Main.newsletterWatermarkLock.Lock()
+	defer wa.Main.newsletterWatermarkLock.Unlock()
+	meta := portal.Metadata.(*waid.PortalMetadata)
+	previousFailures := meta.GetNewsletterUndecodableFailures()
+	updatedFailures := maps.Clone(previousFailures)
+	if updatedFailures == nil {
+		updatedFailures = make(map[int64]int)
+	}
+	serverID := int64(message.MessageServerID)
+	failures := updatedFailures[serverID] + 1
+	updatedFailures[serverID] = failures
+	meta.SetNewsletterUndecodableFailures(updatedFailures)
+	if failures < newsletterUndecodableLimit {
+		if err = portal.Save(ctx); err != nil {
+			meta.SetNewsletterUndecodableFailures(previousFailures)
+			return false, err
+		}
+		wa.UserLogin.Log.Warn().Stringer("newsletter_jid", jid).
+			Int64("server_id", serverID).
+			Int("consecutive_decode_failures", failures).
+			Int("quarantine_threshold", newsletterUndecodableLimit).
+			Msg("Newsletter plaintext remained undecodable; keeping watermark unchanged")
+		return false, nil
+	}
+
+	previousWatermark := meta.LastNewsletterServerID
+	previousPending := slices.Clone(meta.NewsletterPendingServerIDs)
+	if (meta.NewsletterWatermarkVersion >= newsletterWatermarkVersion && serverID <= meta.LastNewsletterServerID) ||
+		slices.Contains(meta.NewsletterPendingServerIDs, serverID) {
+		remainingFailures := maps.Clone(updatedFailures)
+		delete(remainingFailures, serverID)
+		if len(remainingFailures) == 0 {
+			remainingFailures = nil
+		}
+		meta.SetNewsletterUndecodableFailures(remainingFailures)
+		if err = portal.Save(ctx); err != nil {
+			meta.SetNewsletterUndecodableFailures(previousFailures)
+			return false, err
+		}
+		return true, nil
+	}
+	gapClosing := meta.NewsletterWatermarkVersion >= newsletterWatermarkVersion && serverID == meta.LastNewsletterServerID+1
+	if len(meta.NewsletterPendingServerIDs) >= newsletterMaxPending && !gapClosing {
+		meta.SetNewsletterUndecodableFailures(previousFailures)
+		return false, fmt.Errorf("newsletter pending receipt ledger reached bounded %d-item cap", newsletterMaxPending)
+	}
+	quarantinePath, err := wa.writeNewsletterQuarantineEnvelope(jid, message)
+	if err != nil {
+		meta.SetNewsletterUndecodableFailures(previousFailures)
+		return false, err
+	}
+	meta.NewsletterPendingServerIDs = append(meta.NewsletterPendingServerIDs, serverID)
+	if meta.NewsletterWatermarkVersion >= newsletterWatermarkVersion {
+		advanceNewsletterPendingReceipts(meta)
+	}
+	remainingFailures := maps.Clone(updatedFailures)
+	delete(remainingFailures, serverID)
+	if len(remainingFailures) == 0 {
+		remainingFailures = nil
+	}
+	meta.SetNewsletterUndecodableFailures(remainingFailures)
+	if err = portal.Save(ctx); err != nil {
+		meta.LastNewsletterServerID = previousWatermark
+		meta.NewsletterPendingServerIDs = previousPending
+		meta.SetNewsletterUndecodableFailures(previousFailures)
+		return false, err
+	}
+	wa.UserLogin.Log.Warn().Stringer("newsletter_jid", jid).
+		Str("message_id", string(message.MessageID)).
+		Int64("server_id", serverID).
+		Str("receipt_type", "undecodable_quarantined").
+		Int("consecutive_decode_failures", failures).
+		Str("quarantine_file", filepath.Base(quarantinePath)).
+		Bool("terminal_receipt", true).
+		Bool("durably_delivered", false).
+		Bool("watermark_advanced", meta.LastNewsletterServerID > previousWatermark).
+		Int("pending_receipts", len(meta.NewsletterPendingServerIDs)).
+		Msg("Newsletter reliability undecodable quarantine receipt audit")
+	return true, nil
+}
+
+func (wa *WhatsAppClient) clearNewsletterUndecodableFailure(
+	ctx context.Context,
+	jid types.JID,
+	serverID types.MessageServerID,
+) error {
+	portal, err := wa.Main.Bridge.GetPortalByKey(ctx, wa.makeWAPortalKey(jid))
+	if err != nil {
+		return err
+	}
+	wa.Main.newsletterWatermarkLock.Lock()
+	defer wa.Main.newsletterWatermarkLock.Unlock()
+	meta := portal.Metadata.(*waid.PortalMetadata)
+	key := int64(serverID)
+	previousFailures := meta.GetNewsletterUndecodableFailures()
+	if _, exists := previousFailures[key]; !exists {
+		return nil
+	}
+	updatedFailures := maps.Clone(previousFailures)
+	delete(updatedFailures, key)
+	if len(updatedFailures) == 0 {
+		updatedFailures = nil
+	}
+	meta.SetNewsletterUndecodableFailures(updatedFailures)
+	if err = portal.Save(ctx); err != nil {
+		meta.SetNewsletterUndecodableFailures(previousFailures)
+		return err
+	}
+	wa.UserLogin.Log.Debug().Stringer("newsletter_jid", jid).
+		Int("server_id", serverID).
+		Msg("Cleared newsletter undecodable failure count after decode success")
+	return nil
+}
+
 func (wa *WhatsAppClient) recordNewsletterTerminalReceipt(
 	ctx context.Context,
 	portal *bridgev2.Portal,
@@ -759,11 +989,12 @@ func (wa *WhatsAppClient) recordNewsletterTerminalReceipt(
 	serverID types.MessageServerID,
 	receiptType string,
 ) (advanced bool, pending int, err error) {
-	wa.newsletterWatermarkLock.Lock()
-	defer wa.newsletterWatermarkLock.Unlock()
+	wa.Main.newsletterWatermarkLock.Lock()
+	defer wa.Main.newsletterWatermarkLock.Unlock()
 	meta := portal.Metadata.(*waid.PortalMetadata)
 	previousWatermark := meta.LastNewsletterServerID
 	previousPending := slices.Clone(meta.NewsletterPendingServerIDs)
+	previousFailures := meta.GetNewsletterUndecodableFailures()
 	next := int64(serverID)
 	if (meta.NewsletterWatermarkVersion >= newsletterWatermarkVersion && next <= meta.LastNewsletterServerID) ||
 		slices.Contains(meta.NewsletterPendingServerIDs, next) {
@@ -777,9 +1008,16 @@ func (wa *WhatsAppClient) recordNewsletterTerminalReceipt(
 	if meta.NewsletterWatermarkVersion >= newsletterWatermarkVersion {
 		advanceNewsletterPendingReceipts(meta)
 	}
+	updatedFailures := maps.Clone(previousFailures)
+	delete(updatedFailures, next)
+	if len(updatedFailures) == 0 {
+		updatedFailures = nil
+	}
+	meta.SetNewsletterUndecodableFailures(updatedFailures)
 	if err = portal.Save(ctx); err != nil {
 		meta.LastNewsletterServerID = previousWatermark
 		meta.NewsletterPendingServerIDs = previousPending
+		meta.SetNewsletterUndecodableFailures(previousFailures)
 		return false, len(previousPending), err
 	}
 	wa.UserLogin.Log.Debug().Stringer("newsletter_jid", jid).

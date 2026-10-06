@@ -20,6 +20,7 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/json"
+	"sync"
 	"time"
 
 	"go.mau.fi/util/exerrors"
@@ -122,16 +123,45 @@ type ReactionMetadata struct {
 }
 
 type PortalMetadata struct {
-	DisappearingTimerSetAt     int64                `json:"disappearing_timer_set_at,omitempty"`
-	TopicID                    string               `json:"topic_id,omitempty"`
-	LastSync                   jsontime.Unix        `json:"last_sync,omitempty"`
-	CommunityAnnouncementGroup bool                 `json:"is_cag,omitempty"`
-	AddressingMode             types.AddressingMode `json:"addressing_mode,omitempty"`
-	LIDMigrationAttempted      bool                 `json:"lid_migration_attempted,omitempty"`
-	LastNewsletterServerID     int64                `json:"last_newsletter_server_id,omitempty"`
-	NewsletterWatermarkVersion int                  `json:"newsletter_watermark_version,omitempty"`
-	NewsletterPendingServerIDs []int64              `json:"newsletter_pending_server_ids,omitempty"`
-	NewsletterRecoveryBefore   int64                `json:"newsletter_recovery_before,omitempty"`
+	DisappearingTimerSetAt        int64                `json:"disappearing_timer_set_at,omitempty"`
+	TopicID                       string               `json:"topic_id,omitempty"`
+	LastSync                      jsontime.Unix        `json:"last_sync,omitempty"`
+	CommunityAnnouncementGroup    bool                 `json:"is_cag,omitempty"`
+	AddressingMode                types.AddressingMode `json:"addressing_mode,omitempty"`
+	LIDMigrationAttempted         bool                 `json:"lid_migration_attempted,omitempty"`
+	LastNewsletterServerID        int64                `json:"last_newsletter_server_id,omitempty"`
+	NewsletterWatermarkVersion    int                  `json:"newsletter_watermark_version,omitempty"`
+	NewsletterPendingServerIDs    []int64              `json:"newsletter_pending_server_ids,omitempty"`
+	NewsletterRecoveryBefore      int64                `json:"newsletter_recovery_before,omitempty"`
+	NewsletterUndecodableFailures map[int64]int        `json:"newsletter_undecodable_failures,omitempty"`
+
+	newsletterUndecodableFailuresLock sync.RWMutex
+}
+
+func (pm *PortalMetadata) GetNewsletterUndecodableFailures() map[int64]int {
+	pm.newsletterUndecodableFailuresLock.RLock()
+	defer pm.newsletterUndecodableFailuresLock.RUnlock()
+	return pm.NewsletterUndecodableFailures
+}
+
+func (pm *PortalMetadata) SetNewsletterUndecodableFailures(failures map[int64]int) {
+	pm.newsletterUndecodableFailuresLock.Lock()
+	defer pm.newsletterUndecodableFailuresLock.Unlock()
+	pm.NewsletterUndecodableFailures = failures
+}
+
+func (pm *PortalMetadata) MarshalJSON() ([]byte, error) {
+	pm.newsletterUndecodableFailuresLock.RLock()
+	defer pm.newsletterUndecodableFailuresLock.RUnlock()
+	type portalMetadataJSON PortalMetadata
+	return json.Marshal((*portalMetadataJSON)(pm))
+}
+
+func (pm *PortalMetadata) UnmarshalJSON(data []byte) error {
+	pm.newsletterUndecodableFailuresLock.Lock()
+	defer pm.newsletterUndecodableFailuresLock.Unlock()
+	type portalMetadataJSON PortalMetadata
+	return json.Unmarshal(data, (*portalMetadataJSON)(pm))
 }
 
 type GhostMetadata struct {

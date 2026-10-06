@@ -52,18 +52,20 @@ import (
 )
 
 type WhatsAppConnector struct {
-	Bridge      *bridgev2.Bridge
-	Config      Config
-	DeviceStore *sqlstore.Container
-	MsgConv     *msgconv.MessageConverter
-	DB          *wadb.Database
+	Bridge         *bridgev2.Bridge
+	Config         Config
+	RuntimeDataDir string
+	DeviceStore    *sqlstore.Container
+	MsgConv        *msgconv.MessageConverter
+	DB             *wadb.Database
 
 	firstClientConnectOnce sync.Once
 	backgroundConnectOnce  sync.Once
 
-	mediaEditCache         MediaEditCache
-	mediaEditCacheLock     sync.RWMutex
-	stopMediaEditCacheLoop atomic.Pointer[context.CancelFunc]
+	mediaEditCache          MediaEditCache
+	mediaEditCacheLock      sync.RWMutex
+	stopMediaEditCacheLoop  atomic.Pointer[context.CancelFunc]
+	newsletterWatermarkLock sync.Mutex
 }
 
 func init() {
